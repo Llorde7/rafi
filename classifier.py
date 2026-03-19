@@ -5,9 +5,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+MODEL = "llama-3.3-70b-versatile"
 
-SYSTEM_PROMPT = """Return compact JSON for emotion classification using the GoEmotions 28-label taxonomy.
+SYSTEM_PROMPT = """You are a fast emotion classifier using the GoEmotions 28-label taxonomy.
 
 ALLOWED LABELS (exactly these 28):
 admiration, amusement, anger, annoyance, approval, caring, confusion, curiosity,
@@ -16,21 +16,32 @@ gratitude, grief, joy, love, nervousness, neutral, optimism, pride, realization,
 relief, remorse, sadness, surprise
 
 RULES:
-1. Return JSON only with keys: translation, top_3, reasoning.
-2. Use exactly 3 emotions from the allowed list.
-3. Confidence scores must sum to 1.0.
-4. Keep reasoning under 18 words.
-5. If the text is already English, set translation to an empty string."""
+1. Top 3 emotions only. Never invent labels.
+2. Confidence scores: 0.01–0.99, sum to exactly 1.0.
+3. Classify implied behaviour, not literal words.
+4. Return ONLY valid JSON. No markdown, no preamble.
+
+IMPLICIT GUIDE:
+repeated checking/rehearsing → nervousness/fear | two cups/cooking for two → grief
+letting calls ring out → remorse | smiling at nothing → joy
+credit taken for your work → anger | lights on all night → fear
+
+EXAMPLES:
+{"top_3":[{"emotion":"grief","confidence":0.65},{"emotion":"sadness","confidence":0.25},{"emotion":"neutral","confidence":0.10}],"reasoning":"Reflex of reaching for someone gone signals grief."}
+{"top_3":[{"emotion":"nervousness","confidence":0.60},{"emotion":"fear","confidence":0.25},{"emotion":"confusion","confidence":0.15}],"reasoning":"Repeated composing and deleting signals hesitation from anxiety."}"""
+
 
 def compress_history(history: list[dict]) -> str:
     if not history:
         return ""
     lines = []
-    for h in history[-2:]:
+    for h in history[-4:]:
         top = h["top_3"][0]["emotion"] if h.get("top_3") else "neutral"
         conf = h["top_3"][0]["confidence"] if h.get("top_3") else 0.0
-        lines.append(f'"{h["text"][:40]}" -> {top} {conf:.2f}')
-    return "Context: " + " | ".join(lines)
+        reasoning = h.get("reasoning", "")[:80]
+        lines.append(f'- "{h["text"][:60]}" → {top} ({conf:.2f}): {reasoning}')
+    return "Prior turns:\n" + "\n".join(lines)
+
 
 def build_messages(text: str, history: list[dict]) -> list[dict]:
     context = compress_history(history)
@@ -40,14 +51,14 @@ def build_messages(text: str, history: list[dict]) -> list[dict]:
         {"role": "user", "content": user_content}
     ]
 
+
 def classify(text: str, history: list[dict] = None) -> dict:
     messages = build_messages(text, history or [])
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
-        temperature=0,
-        max_tokens=96,
-        response_format={"type": "json_object"},
+        temperature=0.1,
+        max_tokens=200,
     )
     raw = response.choices[0].message.content.strip()
     raw = raw.replace("```json", "").replace("```", "").strip()

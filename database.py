@@ -7,17 +7,17 @@ import os
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DB_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
 
-# detect whether we're on the direct connection (5432) or pooler (6543)
-# and configure the engine accordingly
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL or DB_URL must be set")
+
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+
 if ":5432" in DATABASE_URL:
-    # Ensure we're using asyncpg dialect
-    if DATABASE_URL.startswith("postgresql://"):
-        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-    elif DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-    
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
@@ -25,8 +25,6 @@ if ":5432" in DATABASE_URL:
         pool_size=5,
         max_overflow=10,
         connect_args={
-            # unique prepared statement names prevent conflicts
-            # when the connection is reused across requests
             "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
             "server_settings": {
                 "jit": "off",
@@ -35,13 +33,6 @@ if ":5432" in DATABASE_URL:
         },
     )
 else:
-    # transaction pooler (port 6543) — disable prepared statements entirely
-    # Ensure we're using asyncpg dialect
-    if DATABASE_URL.startswith("postgresql://"):
-        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-    elif DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-    
     engine = create_async_engine(
         DATABASE_URL + "?prepared_statement_cache_size=0",
         echo=False,
@@ -54,8 +45,10 @@ AsyncSessionLocal = sessionmaker(
     expire_on_commit=False
 )
 
+
 class Base(DeclarativeBase):
     pass
+
 
 async def get_db():
     async with AsyncSessionLocal() as session:

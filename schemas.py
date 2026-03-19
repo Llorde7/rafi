@@ -32,10 +32,15 @@ class TriggerSpan(BaseModel):
 
 
 class CausalAnalysis(BaseModel):
+    confidence_score: float
+    confidence_category: str
     trigger_spans: list[TriggerSpan]
     global_cause: str
     causal_chain: list[str]
     temporal_pattern: Optional[str] = None
+    cause_type: str
+    clarifying_question: Optional[str] = None
+    planner_instruction: str
     error: Optional[str] = None
 
 
@@ -60,10 +65,15 @@ class CausalRequest(BaseModel):
 class CausalResponse(BaseModel):
     session_id: UUID
     text: str
+    confidence_score: float
+    confidence_category: str
     trigger_spans: list[TriggerSpan]
     global_cause: str
     causal_chain: list[str]
     temporal_pattern: Optional[str] = None
+    cause_type: str
+    clarifying_question: Optional[str] = None
+    planner_instruction: str
     error: Optional[str] = None
 
 
