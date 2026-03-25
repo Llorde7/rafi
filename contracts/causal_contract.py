@@ -45,6 +45,7 @@ class CausalInput(BaseModel):
     top_emotions: list[dict]
     reasoning: str
     session_history: list[HistoryTurn] = []
+    trajectory_context: Optional[str] = None  # formatted summary from trajectory_engine
 
 
 class CausalOutput(BaseModel):

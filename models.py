@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, JSON, ForeignKey, Text
+from sqlalchemy import Column, String, DateTime, JSON, ForeignKey, Text, Float, Integer
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from database import Base
@@ -28,3 +28,20 @@ class Turn(Base):
     causal_analysis = Column(JSON, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
     session         = relationship("Session", back_populates="turns")
+
+
+class UserEmotionalProfile(Base):
+    """
+    Persisted cross-session emotional baseline per user.
+    Written/updated at session close. Read at session open.
+    Only populated for authenticated users (user_id not null).
+    """
+    __tablename__ = "user_emotional_profiles"
+
+    user_id                  = Column(String, primary_key=True)
+    sessions_seen            = Column(Integer, default=0)
+    mean_valence             = Column(Float, default=0.0)
+    dominant_cause_types     = Column(JSON, default=list)   # list[str], ranked
+    last_session_flag        = Column(String, nullable=True)
+    last_session_end_emotion = Column(String, nullable=True)
+    updated_at               = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

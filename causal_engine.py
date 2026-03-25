@@ -113,12 +113,15 @@ def analyse(input: CausalInput) -> CausalOutput:
     """
     emotions_str = json.dumps(input.top_emotions)
     history_str = _format_history(input.session_history)
+    trajectory_str = input.trajectory_context or "Emotional trajectory: not available."
 
     user_content = f"""User message: "{input.text}"
 Classified emotions: {emotions_str}
 Classification reasoning: {input.reasoning}
 
 {history_str}
+
+{trajectory_str}
 
 Perform causal analysis."""
 
