@@ -94,9 +94,12 @@ def update_trajectory(
         "valence_series":   new_valences,
         "arousal_series":   new_arousals,
         "shift_events":     new_shifts,
-        "valence_direction": direction.value,
-        "current_arousal":  arousal.value,
-        "current_flag":     flag.value,
+        # Keep enum-typed fields as enum members. model_copy(update=...)
+        # does not validate, so writing raw strings here leaves the model in
+        # an invalid in-memory state and triggers serializer warnings later.
+        "valence_direction": direction,
+        "current_arousal":  arousal,
+        "current_flag":     flag,
     })
 
 
@@ -193,7 +196,7 @@ def format_trajectory_for_llm(trajectory: SessionTrajectory) -> str:
         v_now   = trajectory.valence_series[-1]
         lines.append(
             f"  Valence: started at {v_start:+.2f}, currently {v_now:+.2f} "
-            f"({trajectory.valence_direction})"
+            f"({trajectory.valence_direction.value})"
         )
 
     # Emotion arc (last 4 only)
@@ -201,11 +204,11 @@ def format_trajectory_for_llm(trajectory: SessionTrajectory) -> str:
     lines.append(f"  Recent emotion arc: {' → '.join(recent)}")
 
     # Arousal
-    lines.append(f"  Current arousal: {trajectory.current_arousal}")
+    lines.append(f"  Current arousal: {trajectory.current_arousal.value}")
 
     # Flag
-    if trajectory.current_flag != TrajectoryFlag.NONE.value:
-        lines.append(f"  ⚠ Trajectory flag: {trajectory.current_flag}")
+    if trajectory.current_flag != TrajectoryFlag.NONE:
+        lines.append(f"  Trajectory flag: {trajectory.current_flag.value}")
 
     # Shift events
     for shift in trajectory.shift_events[-2:]:  # last 2 only

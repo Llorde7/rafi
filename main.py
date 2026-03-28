@@ -143,7 +143,7 @@ async def close_session_trajectory(
             sessions_seen=1,
             mean_valence=session_mean_valence,
             dominant_cause_types=ranked_causes[:3],
-            last_session_flag=trajectory.current_flag,
+            last_session_flag=trajectory.current_flag.value,
             last_session_end_emotion=(
                 trajectory.dominant_emotions[-1]
                 if trajectory.dominant_emotions else None
@@ -164,7 +164,7 @@ async def close_session_trajectory(
         profile.sessions_seen            = n + 1
         profile.mean_valence             = round(new_mean, 4)
         profile.dominant_cause_types     = merged_causes[:3]
-        profile.last_session_flag        = trajectory.current_flag
+        profile.last_session_flag        = trajectory.current_flag.value
         profile.last_session_end_emotion = (
             trajectory.dominant_emotions[-1]
             if trajectory.dominant_emotions else None
@@ -384,7 +384,7 @@ async def close_session(session_id: str, db: AsyncSession = Depends(get_db)):
     return {
         "status": "closed",
         "session_id": session_id,
-        "trajectory_flag": trajectory.current_flag,
+        "trajectory_flag": trajectory.current_flag.value,
         "turns": trajectory.turn_count,
     }
 
