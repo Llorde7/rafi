@@ -1,11 +1,17 @@
-import os, json
+import json
+import logging
+import os
+
 from groq import Groq
 from dotenv import load_dotenv
+
+from contracts.classifier_contract import ClassifierOutput
 
 load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL = "llama-3.3-70b-versatile"
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a fast emotion classifier using the GoEmotions 28-label taxonomy.
 
@@ -38,8 +44,7 @@ def compress_history(history: list[dict]) -> str:
     for h in history[-4:]:
         top = h["top_3"][0]["emotion"] if h.get("top_3") else "neutral"
         conf = h["top_3"][0]["confidence"] if h.get("top_3") else 0.0
-        reasoning = h.get("reasoning", "")[:80]
-        lines.append(f'- "{h["text"][:60]}" → {top} ({conf:.2f}): {reasoning}')
+        lines.append(f'- "{h["text"][:60]}" → {top} ({conf:.2f})')
     return "Prior turns:\n" + "\n".join(lines)
 
 
@@ -52,15 +57,63 @@ def build_messages(text: str, history: list[dict]) -> list[dict]:
     ]
 
 
-def classify(text: str, history: list[dict] = None) -> dict:
-    messages = build_messages(text, history or [])
+def _call_model(messages: list[dict], max_tokens: int) -> str:
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
         temperature=0.1,
-        max_tokens=200,
+        max_tokens=max_tokens,
     )
-    raw = response.choices[0].message.content.strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    start, end = raw.index("{"), raw.rindex("}") + 1
-    return json.loads(raw[start:end])
+    return response.choices[0].message.content.strip()
+
+
+def _extract_json_object(raw: str) -> dict:
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    start, end = cleaned.index("{"), cleaned.rindex("}") + 1
+    return json.loads(cleaned[start:end])
+
+
+def _build_repair_messages(messages: list[dict], raw: str, error: Exception) -> list[dict]:
+    return messages + [
+        {"role": "assistant", "content": raw},
+        {
+            "role": "user",
+            "content": (
+                "Repair the previous response. Return only valid JSON with this shape: "
+                '{"top_3":[{"emotion":"<allowed GoEmotions label>","confidence":<float>}],'
+                '"reasoning":"<brief explanation>"} '
+                "Requirements: exactly 3 unique allowed labels, confidences between 0 and 1, "
+                "sorted descending, summing to 1.0. "
+                f"Validation error: {error}"
+            ),
+        },
+    ]
+
+
+def _validate_classifier_payload(text: str, data: dict) -> ClassifierOutput:
+    return ClassifierOutput(
+        text=text,
+        translation=data.get("translation"),
+        top_3=data["top_3"],
+        reasoning=data["reasoning"],
+    )
+
+
+def classify(text: str, history: list[dict] = None) -> ClassifierOutput:
+    messages = build_messages(text, history or [])
+
+    raw = _call_model(messages, max_tokens=200)
+    first_error: Exception | None = None
+    try:
+        return _validate_classifier_payload(text, _extract_json_object(raw))
+    except Exception as exc:
+        first_error = exc
+        logger.warning("Classifier parse/validation failed on first attempt: %s", exc)
+
+    repair_messages = _build_repair_messages(messages, raw, first_error)
+    repaired_raw = _call_model(repair_messages, max_tokens=220)
+    try:
+        return _validate_classifier_payload(text, _extract_json_object(repaired_raw))
+    except Exception:
+        logger.exception("Classifier parse/validation failed after repair attempt")
+        raise

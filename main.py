@@ -98,7 +98,7 @@ async def save_all_histories(
     await redis.setex(
         f"session:{session_id}:causal_history",
         TTL,
-        json.dumps([h.model_dump() for h in causal_history[-6:]])
+        json.dumps([h.model_dump(mode="json") for h in causal_history[-6:]])
     )
     await redis.setex(
         f"session:{session_id}:trajectory",
@@ -244,9 +244,9 @@ async def classify_emotion(
         session_id=db_session.id,
         text=req.text,
         translation=envelope.classifier_output.translation,
-        top_3=[e.model_dump() for e in envelope.classifier_output.top_3],
+        top_3=[e.model_dump(mode="json") for e in envelope.classifier_output.top_3],
         reasoning=envelope.classifier_output.reasoning,
-        causal_analysis=envelope.causal_output.model_dump()
+        causal_analysis=envelope.causal_output.model_dump(mode="json")
     )
     db.add(turn)
     await db.commit()
@@ -258,7 +258,7 @@ async def classify_emotion(
     classifier_history.append({
         "text": req.text,
         "translation": envelope.classifier_output.translation,
-        "top_3": [e.model_dump() for e in envelope.classifier_output.top_3],
+        "top_3": [e.model_dump(mode="json") for e in envelope.classifier_output.top_3],
         "reasoning": envelope.classifier_output.reasoning,
     })
     causal_history.append(new_history_turn)
@@ -275,9 +275,9 @@ async def classify_emotion(
         session_id=db_session.id,
         text=turn.text,
         translation=turn.translation,
-        top_3=[e.model_dump() for e in envelope.classifier_output.top_3],
+        top_3=[e.model_dump(mode="json") for e in envelope.classifier_output.top_3],
         reasoning=envelope.classifier_output.reasoning,
-        causal_analysis=envelope.causal_output.model_dump(),
+        causal_analysis=envelope.causal_output.model_dump(mode="json"),
         created_at=turn.created_at
     )
 

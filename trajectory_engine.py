@@ -7,6 +7,7 @@ No I/O. No LLM calls. Pure pattern detection.
 Called by the orchestrator after every turn.
 """
 
+from contracts.classifier_contract import EmotionScore
 from contracts.trajectory_contract import (
     SessionTrajectory,
     EmotionShiftEvent,
@@ -38,21 +39,43 @@ def arousal_to_int(a) -> int:
     return {"low": 0, "medium": 1, "high": 2}[key]
 
 
+def _weighted_valence(scores: list[EmotionScore]) -> float:
+    if not scores:
+        return 0.0
+    return sum(get_valence(score.emotion.value) * score.confidence for score in scores)
+
+
+def _weighted_arousal(scores: list[EmotionScore]) -> ArousalLevel:
+    if not scores:
+        return ArousalLevel.MEDIUM
+
+    weighted_score = sum(
+        arousal_to_int(get_arousal(score.emotion.value)) * score.confidence
+        for score in scores
+    )
+
+    if weighted_score < 0.5:
+        return ArousalLevel.LOW
+    if weighted_score < 1.5:
+        return ArousalLevel.MEDIUM
+    return ArousalLevel.HIGH
+
+
 # ─── Core update ─────────────────────────────────────────────────────────────
 
 def update_trajectory(
     trajectory: SessionTrajectory,
-    top_emotion: str,
-    confidence: float,
-    cause_type: str | None = None,
+    emotion_scores: list[EmotionScore],
 ) -> SessionTrajectory:
     """
     Ingest one new turn. Returns an updated SessionTrajectory.
     Does NOT mutate — works on a copy via model_copy(update=...).
     """
-    valence      = get_valence(top_emotion)
-    arousal      = get_arousal(top_emotion)
-    turn_index   = trajectory.turn_count  # 0-based index of the incoming turn
+    top_emotion = emotion_scores[0].emotion.value if emotion_scores else "neutral"
+    confidence  = emotion_scores[0].confidence if emotion_scores else 0.0
+    valence     = _weighted_valence(emotion_scores)
+    arousal     = _weighted_arousal(emotion_scores)
+    turn_index  = trajectory.turn_count  # 0-based index of the incoming turn
 
     new_dominants  = trajectory.dominant_emotions + [top_emotion]
     new_valences   = trajectory.valence_series    + [valence]

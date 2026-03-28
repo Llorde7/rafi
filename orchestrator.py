@@ -29,7 +29,7 @@ def _map_classifier_to_causal(
 ) -> CausalInput:
     return CausalInput(
         text=classifier_output.text,
-        top_emotions=[e.model_dump() for e in classifier_output.top_3],
+        top_emotions=[e.model_dump(mode="json") for e in classifier_output.top_3],
         reasoning=classifier_output.reasoning,
         session_history=session_history,
         trajectory_context=format_trajectory_for_llm(trajectory),
@@ -44,7 +44,7 @@ def _map_turn_to_history(
     top = classifier_output.top_3[0] if classifier_output.top_3 else None
     return HistoryTurn(
         text=text,
-        top_emotion=top.emotion if top else "neutral",
+        top_emotion=top.emotion.value if top else "neutral",
         confidence=top.confidence if top else 0.0,
         cause_type=causal_output.cause_type.value,
         temporal_pattern=causal_output.temporal_pattern
@@ -54,13 +54,7 @@ def _map_turn_to_history(
 # ─── Agent wrappers ───────────────────────────────────────────────────────────
 
 def _run_classifier(input: ClassifierInput, history: list[dict]) -> ClassifierOutput:
-    raw = _classify_raw(input.text, history)
-    return ClassifierOutput(
-        text=input.text,
-        translation=raw.get("translation"),
-        top_3=raw.get("top_3", []),
-        reasoning=raw.get("reasoning", "")
-    )
+    return _classify_raw(input.text, history)
 
 
 def _run_causal(input: CausalInput) -> CausalOutput:
@@ -122,14 +116,11 @@ def advance_trajectory(
     Update trajectory from completed pipeline envelope.
     Called by main.py after pipeline completes, before saving to Redis.
     """
-    top = (envelope.classifier_output.top_3[0]
-           if envelope.classifier_output.top_3 else None)
-    top_emotion = top.emotion if top else "neutral"
-    confidence  = top.confidence if top else 0.0
-    cause_type  = (envelope.causal_output.cause_type.value
-                   if envelope.causal_output else None)
-
-    return update_trajectory(trajectory, top_emotion, confidence, cause_type)
+    emotion_scores = (
+        envelope.classifier_output.top_3
+        if envelope.classifier_output else []
+    )
+    return update_trajectory(trajectory, emotion_scores)
 
 
 def get_escalation_flag(trajectory: SessionTrajectory) -> TrajectoryFlag | None:

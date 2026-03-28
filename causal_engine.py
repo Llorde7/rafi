@@ -1,4 +1,7 @@
-import os, json
+import json
+import logging
+import os
+
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -10,6 +13,7 @@ from contracts.causal_contract import (
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL = "llama-3.3-70b-versatile"
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a causal analysis engine for a mental health chatbot pipeline.
 
@@ -105,6 +109,85 @@ def _derive_planner_instruction(
     return PlannerInstruction.PROCEED
 
 
+def _call_model(messages: list[dict], max_tokens: int) -> str:
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=0.1,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _extract_json_object(raw: str) -> dict:
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    start, end = cleaned.index("{"), cleaned.rindex("}") + 1
+    return json.loads(cleaned[start:end])
+
+
+def _build_repair_messages(messages: list[dict], raw: str, error: Exception) -> list[dict]:
+    return messages + [
+        {"role": "assistant", "content": raw},
+        {
+            "role": "user",
+            "content": (
+                "Repair the previous response. Return only valid JSON matching the causal "
+                "analysis schema exactly. Keep trigger spans verbatim substrings from the "
+                f'user message. Validation error: {error}'
+            ),
+        },
+    ]
+
+
+def _validate_causal_payload(input: CausalInput, data: dict) -> CausalOutput:
+    required_fields = [
+        "confidence_score",
+        "confidence_category",
+        "global_cause",
+        "cause_type",
+        "planner_instruction",
+    ]
+    missing = [field for field in required_fields if field not in data]
+    if missing:
+        raise ValueError(f"LLM response missing required fields: {missing}")
+
+    validated_spans = [
+        TriggerSpan(**span)
+        for span in data.get("trigger_spans", [])
+        if span.get("span") and span["span"] in input.text
+    ]
+
+    try:
+        category = ConfidenceCategory(data["confidence_category"])
+    except ValueError:
+        category = ConfidenceCategory.INSUFFICIENT
+
+    try:
+        cause_type = CauseType(data["cause_type"])
+    except ValueError:
+        cause_type = CauseType.AMBIGUOUS
+
+    clarifying_question = data.get("clarifying_question")
+    if category == ConfidenceCategory.CONFIDENT:
+        clarifying_question = None
+    if category != ConfidenceCategory.CONFIDENT and not clarifying_question:
+        clarifying_question = "Could you tell me a bit more about what's been happening for you?"
+
+    planner_instruction = _derive_planner_instruction(category, clarifying_question)
+
+    return CausalOutput(
+        confidence_score=round(float(data.get("confidence_score", 0.5)), 3),
+        confidence_category=category,
+        trigger_spans=validated_spans,
+        global_cause=data.get("global_cause", ""),
+        causal_chain=data.get("causal_chain", []),
+        temporal_pattern=data.get("temporal_pattern"),
+        cause_type=cause_type,
+        clarifying_question=clarifying_question,
+        planner_instruction=planner_instruction,
+    )
+
+
 def analyse(input: CausalInput) -> CausalOutput:
     """
     Receives CausalInput contract.
@@ -126,70 +209,22 @@ Classification reasoning: {input.reasoning}
 Perform causal analysis."""
 
     try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_content}
-            ],
-            temperature=0.1,
-            max_tokens=500,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        start, end = raw.index("{"), raw.rindex("}") + 1
-        data = json.loads(raw[start:end])
-
-        required_fields = [
-            "confidence_score",
-            "confidence_category",
-            "global_cause",
-            "cause_type",
-            "planner_instruction",
-        ]
-        missing = [f for f in required_fields if f not in data]
-        if missing:
-            raise ValueError(f"LLM response missing required fields: {missing}")
-
-        validated_spans = [
-            TriggerSpan(**s)
-            for s in data.get("trigger_spans", [])
-            if s.get("span") and s["span"] in input.text
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content}
         ]
 
+        raw = _call_model(messages, max_tokens=500)
         try:
-            category = ConfidenceCategory(data["confidence_category"])
-        except ValueError:
-            category = ConfidenceCategory.INSUFFICIENT
-
-        try:
-            cause_type = CauseType(data["cause_type"])
-        except ValueError:
-            cause_type = CauseType.AMBIGUOUS
-
-        clarifying_question = data.get("clarifying_question")
-
-        if category == ConfidenceCategory.CONFIDENT:
-            clarifying_question = None
-
-        if category != ConfidenceCategory.CONFIDENT and not clarifying_question:
-            clarifying_question = "Could you tell me a bit more about what's been happening for you?"
-
-        planner_instruction = _derive_planner_instruction(category, clarifying_question)
-
-        return CausalOutput(
-            confidence_score=round(float(data.get("confidence_score", 0.5)), 3),
-            confidence_category=category,
-            trigger_spans=validated_spans,
-            global_cause=data.get("global_cause", ""),
-            causal_chain=data.get("causal_chain", []),
-            temporal_pattern=data.get("temporal_pattern"),
-            cause_type=cause_type,
-            clarifying_question=clarifying_question,
-            planner_instruction=planner_instruction,
-        )
+            return _validate_causal_payload(input, _extract_json_object(raw))
+        except Exception as exc:
+            logger.warning("Causal parse/validation failed on first attempt: %s", exc)
+            repair_messages = _build_repair_messages(messages, raw, exc)
+            repaired_raw = _call_model(repair_messages, max_tokens=550)
+            return _validate_causal_payload(input, _extract_json_object(repaired_raw))
 
     except Exception as e:
+        logger.exception("Causal analysis failed after retry/repair: %s", e)
         return CausalOutput(
             confidence_score=0.0,
             confidence_category=ConfidenceCategory.INSUFFICIENT,
