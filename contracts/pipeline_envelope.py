@@ -5,6 +5,7 @@ from datetime import datetime
 
 from contracts.classifier_contract import ClassifierOutput
 from contracts.causal_contract import CausalOutput
+from contracts.planner_contract import PlannerOutput
 
 
 class PipelineEnvelope(BaseModel):
@@ -16,4 +17,4 @@ class PipelineEnvelope(BaseModel):
 
     classifier_output: Optional[ClassifierOutput] = None
     causal_output:     Optional[CausalOutput]     = None
-    # planner_output:  Optional[PlannerOutput]    = None
+    planner_output:    Optional[PlannerOutput]    = None

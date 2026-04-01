@@ -26,6 +26,7 @@ class Turn(Base):
     top_3           = Column(JSON, nullable=False)
     reasoning       = Column(Text, nullable=True)
     causal_analysis = Column(JSON, nullable=True)
+    planner_output  = Column(JSON, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
     session         = relationship("Session", back_populates="turns")
 

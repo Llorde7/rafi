@@ -44,6 +44,22 @@ class CausalAnalysis(BaseModel):
     error: Optional[str] = None
 
 
+class PlannerResult(BaseModel):
+    framework: str
+    strategy: str
+    planner_confidence: str
+    rationale: str
+    clarifying_question: Optional[str] = None
+    clarifying_question_overridden: bool = False
+    response_directive: str
+    escalate_to_safety: bool = False
+    escalation_reason: Optional[str] = None
+    kb_context: Optional[str] = None
+    kb_sources: list[str] = []
+    kb_retrieval_attempted: bool = False
+    error: Optional[str] = None
+
+
 class TurnResponse(BaseModel):
     turn_id: UUID
     session_id: UUID
@@ -52,6 +68,7 @@ class TurnResponse(BaseModel):
     top_3: list[EmotionScore]
     reasoning: str
     causal_analysis: Optional[CausalAnalysis] = None
+    planner_output: Optional[PlannerResult] = None
     created_at: datetime
 
 

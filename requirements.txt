@@ -6,3 +6,5 @@ upstash-redis
 python-dotenv
 groq
 pydantic
+qdrant-client
+fastembed
