@@ -1,7 +1,7 @@
 import json
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import selectinload
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -36,6 +36,9 @@ async def lifespan(app: FastAPI):
     global redis
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text("ALTER TABLE turns ADD COLUMN IF NOT EXISTS planner_output JSON")
+        )
     redis = Redis.from_env()
     yield
 
@@ -222,7 +225,7 @@ async def classify_emotion(
     trajectory         = await get_trajectory(session_id_str, user_id, db)
 
     # ── Run pipeline ──────────────────────────────────────────────────────────
-    envelope: PipelineEnvelope = run_pipeline(
+    envelope: PipelineEnvelope = await run_pipeline(
         text=req.text,
         session_id=session_id_str,
         user_id=user_id,
@@ -246,7 +249,11 @@ async def classify_emotion(
         translation=envelope.classifier_output.translation,
         top_3=[e.model_dump(mode="json") for e in envelope.classifier_output.top_3],
         reasoning=envelope.classifier_output.reasoning,
-        causal_analysis=envelope.causal_output.model_dump(mode="json")
+        causal_analysis=envelope.causal_output.model_dump(mode="json"),
+        planner_output=(
+            envelope.planner_output.model_dump(mode="json")
+            if envelope.planner_output else None
+        ),
     )
     db.add(turn)
     await db.commit()
@@ -278,6 +285,10 @@ async def classify_emotion(
         top_3=[e.model_dump(mode="json") for e in envelope.classifier_output.top_3],
         reasoning=envelope.classifier_output.reasoning,
         causal_analysis=envelope.causal_output.model_dump(mode="json"),
+        planner_output=(
+            envelope.planner_output.model_dump(mode="json")
+            if envelope.planner_output else None
+        ),
         created_at=turn.created_at
     )
 
@@ -308,6 +319,7 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
                 top_3=t.top_3,
                 reasoning=t.reasoning,
                 causal_analysis=t.causal_analysis,
+                planner_output=t.planner_output,
                 created_at=t.created_at
             )
             for t in db_session.turns
