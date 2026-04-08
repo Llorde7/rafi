@@ -1,3 +1,6 @@
+import logging
+from time import perf_counter
+
 from contracts.classifier_contract import ClassifierInput, ClassifierOutput
 from contracts.causal_contract import CausalInput, CausalOutput, HistoryTurn
 from contracts.planner_contract import PlannerInput, PlannerOutput
@@ -8,6 +11,9 @@ from classifier import classify as _classify_raw
 from causal_engine import analyse as _analyse_raw
 from planner_engine import plan_async as _plan_raw
 from trajectory_engine import update_trajectory, format_trajectory_for_llm, _weighted_valence
+
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Mappers ──────────────────────────────────────────────────────────────────
@@ -124,21 +130,45 @@ async def run_pipeline(
         user_id=user_id,
         raw_text=text
     )
+    pipeline_started = perf_counter()
 
     # Stage 1: Classifier
     classifier_input  = _map_to_classifier_input(text, session_id, user_id)
+    classifier_started = perf_counter()
     classifier_output = _run_classifier(classifier_input, classifier_history)
+    logger.info(
+        "Pipeline timing | session_id=%s stage=classifier duration_ms=%.1f",
+        session_id,
+        (perf_counter() - classifier_started) * 1000,
+    )
     envelope.classifier_output = classifier_output
 
     # Stage 2: Causal Analysis
     causal_input  = _map_classifier_to_causal(classifier_output, causal_history, trajectory)
+    causal_started = perf_counter()
     causal_output = _run_causal(causal_input)
+    logger.info(
+        "Pipeline timing | session_id=%s stage=causal duration_ms=%.1f",
+        session_id,
+        (perf_counter() - causal_started) * 1000,
+    )
     envelope.causal_output = causal_output
 
     # Stage 3: Strategic Planner (async — may trigger RAG)
     planner_input  = _map_to_planner_input(classifier_output, causal_output, trajectory)
+    planner_started = perf_counter()
     planner_output = await _run_planner(planner_input)
+    logger.info(
+        "Pipeline timing | session_id=%s stage=planner duration_ms=%.1f",
+        session_id,
+        (perf_counter() - planner_started) * 1000,
+    )
     envelope.planner_output = planner_output
+    logger.info(
+        "Pipeline timing | session_id=%s stage=total duration_ms=%.1f",
+        session_id,
+        (perf_counter() - pipeline_started) * 1000,
+    )
 
     return envelope
 

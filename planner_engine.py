@@ -17,6 +17,8 @@ The planner may override it if it has a more targeted one.
 
 import os
 import json
+import logging
+from time import perf_counter
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -28,6 +30,7 @@ from contracts.planner_contract import (
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL  = "llama-3.3-70b-versatile"
+logger = logging.getLogger(__name__)
 
 
 # ─── System prompt ────────────────────────────────────────────────────────────
@@ -265,14 +268,27 @@ async def plan_async(inp: PlannerInput) -> PlannerOutput:
     """
     from rag.rag_pipeline import run_rag
 
+    planning_started = perf_counter()
     output = plan(inp)
+    logger.info(
+        "Planner timing | stage=plan strategy=%s duration_ms=%.1f",
+        output.strategy.value,
+        (perf_counter() - planning_started) * 1000,
+    )
 
     if (
         output.strategy == ResponseStrategy.PSYCHOEDUCATE
         and not output.error
         and not output.escalate_to_safety
     ):
+        rag_started = perf_counter()
         rag_result = await run_rag(inp)
+        logger.info(
+            "Planner timing | stage=rag duration_ms=%.1f retrieval_successful=%s summary_present=%s",
+            (perf_counter() - rag_started) * 1000,
+            rag_result.retrieval_successful,
+            bool(rag_result.summary),
+        )
 
         if rag_result.summary:
             enriched_directive = (
@@ -291,4 +307,9 @@ async def plan_async(inp: PlannerInput) -> PlannerOutput:
                 "kb_retrieval_attempted": True,
             })
 
+    logger.info(
+        "Planner timing | stage=total duration_ms=%.1f final_strategy=%s",
+        (perf_counter() - planning_started) * 1000,
+        output.strategy.value,
+    )
     return output

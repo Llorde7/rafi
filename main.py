@@ -1,4 +1,7 @@
+import asyncio
 import json
+import logging
+from time import perf_counter
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
@@ -28,6 +31,11 @@ from orchestrator import (
 )
 
 load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s",
+)
+logger = logging.getLogger(__name__)
 redis: Redis = None
 
 
@@ -47,6 +55,7 @@ app = FastAPI(title="EmpathAI", lifespan=lifespan)
 
 
 # ─── Redis helpers ─────────────────────────────────────────────────────────────
+SESSION_META_TTL = 3600
 
 async def get_classifier_history(session_id: str) -> list[dict]:
     raw = await redis.get(f"session:{session_id}:classifier_history")
@@ -60,14 +69,19 @@ async def get_causal_history(session_id: str) -> list[HistoryTurn]:
     return [HistoryTurn(**h) for h in json.loads(raw)]
 
 
+async def get_cached_trajectory(session_id: str) -> SessionTrajectory | None:
+    raw = await redis.get(f"session:{session_id}:trajectory")
+    return SessionTrajectory(**json.loads(raw)) if raw else None
+
+
 async def get_trajectory(session_id: str, user_id: str | None, db: AsyncSession) -> SessionTrajectory:
     """
     Load trajectory from Redis. On first turn of a session, seed cross-session
     baseline from Postgres if the user has a prior profile.
     """
-    raw = await redis.get(f"session:{session_id}:trajectory")
-    if raw:
-        return SessionTrajectory(**json.loads(raw))
+    cached = await get_cached_trajectory(session_id)
+    if cached:
+        return cached
 
     # New session — build fresh trajectory, seed from user profile if available
     traj = SessionTrajectory(session_id=session_id)
@@ -92,21 +106,22 @@ async def save_all_histories(
     causal_history: list[HistoryTurn],
     trajectory: SessionTrajectory,
 ):
-    TTL = 3600
-    await redis.setex(
-        f"session:{session_id}:classifier_history",
-        TTL,
-        json.dumps(classifier_history[-6:])
-    )
-    await redis.setex(
-        f"session:{session_id}:causal_history",
-        TTL,
-        json.dumps([h.model_dump(mode="json") for h in causal_history[-6:]])
-    )
-    await redis.setex(
-        f"session:{session_id}:trajectory",
-        TTL,
-        trajectory.model_dump_json()
+    await asyncio.gather(
+        redis.setex(
+            f"session:{session_id}:classifier_history",
+            SESSION_META_TTL,
+            json.dumps(classifier_history[-6:])
+        ),
+        redis.setex(
+            f"session:{session_id}:causal_history",
+            SESSION_META_TTL,
+            json.dumps([h.model_dump(mode="json") for h in causal_history[-6:]])
+        ),
+        redis.setex(
+            f"session:{session_id}:trajectory",
+            SESSION_META_TTL,
+            trajectory.model_dump_json()
+        ),
     )
 
 
@@ -204,6 +219,9 @@ async def classify_emotion(
     req: ClassifyRequest,
     db: AsyncSession = Depends(get_db)
 ):
+    request_started = perf_counter()
+
+    session_started = perf_counter()
     if req.session_id:
         result = await db.execute(
             select(DBSession).where(DBSession.id == req.session_id)
@@ -215,16 +233,35 @@ async def classify_emotion(
         db_session = DBSession(user_id=req.user_id)
         db.add(db_session)
         await db.flush()
+    logger.info(
+        "API timing | session_id=%s stage=session_lookup duration_ms=%.1f",
+        str(db_session.id),
+        (perf_counter() - session_started) * 1000,
+    )
 
     session_id_str = str(db_session.id)
     user_id        = req.user_id or db_session.user_id
 
     # ── Load histories ────────────────────────────────────────────────────────
-    classifier_history = await get_classifier_history(session_id_str)
-    causal_history     = await get_causal_history(session_id_str)
-    trajectory         = await get_trajectory(session_id_str, user_id, db)
+    history_started = perf_counter()
+    classifier_history, causal_history, cached_trajectory = await asyncio.gather(
+        get_classifier_history(session_id_str),
+        get_causal_history(session_id_str),
+        get_cached_trajectory(session_id_str),
+    )
+    trajectory = (
+        cached_trajectory
+        if cached_trajectory is not None
+        else await get_trajectory(session_id_str, user_id, db)
+    )
+    logger.info(
+        "API timing | session_id=%s stage=load_histories duration_ms=%.1f",
+        session_id_str,
+        (perf_counter() - history_started) * 1000,
+    )
 
     # ── Run pipeline ──────────────────────────────────────────────────────────
+    pipeline_started = perf_counter()
     envelope: PipelineEnvelope = await run_pipeline(
         text=req.text,
         session_id=session_id_str,
@@ -232,6 +269,11 @@ async def classify_emotion(
         classifier_history=classifier_history,
         causal_history=causal_history,
         trajectory=trajectory,
+    )
+    logger.info(
+        "API timing | session_id=%s stage=pipeline duration_ms=%.1f",
+        session_id_str,
+        (perf_counter() - pipeline_started) * 1000,
     )
 
     # ── Advance trajectory ────────────────────────────────────────────────────
@@ -243,6 +285,7 @@ async def classify_emotion(
     # For now it is available on the envelope for downstream consumers.
 
     # ── Persist turn ──────────────────────────────────────────────────────────
+    db_started = perf_counter()
     turn = Turn(
         session_id=db_session.id,
         text=req.text,
@@ -256,8 +299,13 @@ async def classify_emotion(
         ),
     )
     db.add(turn)
+    await db.flush()
     await db.commit()
-    await db.refresh(turn)
+    logger.info(
+        "API timing | session_id=%s stage=db_commit_refresh duration_ms=%.1f",
+        session_id_str,
+        (perf_counter() - db_started) * 1000,
+    )
 
     # ── Update histories ──────────────────────────────────────────────────────
     new_history_turn = build_history_turn(req.text, envelope)
@@ -270,11 +318,22 @@ async def classify_emotion(
     })
     causal_history.append(new_history_turn)
 
+    redis_started = perf_counter()
     await save_all_histories(
         session_id_str,
         classifier_history,
         causal_history,
         updated_trajectory,
+    )
+    logger.info(
+        "API timing | session_id=%s stage=redis_save duration_ms=%.1f",
+        session_id_str,
+        (perf_counter() - redis_started) * 1000,
+    )
+    logger.info(
+        "API timing | session_id=%s stage=total duration_ms=%.1f",
+        session_id_str,
+        (perf_counter() - request_started) * 1000,
     )
 
     return TurnResponse(
