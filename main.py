@@ -4,14 +4,14 @@ import logging
 from time import perf_counter
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import selectinload
 from contextlib import asynccontextmanager
 from datetime import datetime
 from dotenv import load_dotenv
 from upstash_redis.asyncio import Redis
 
-from database import engine, get_db, Base
+import database
 from models import Session as DBSession, Turn, UserEmotionalProfile
 from contracts.causal_contract import HistoryTurn
 from contracts.pipeline_envelope import PipelineEnvelope
@@ -39,14 +39,36 @@ logger = logging.getLogger(__name__)
 redis: Redis = None
 
 
+async def ensure_turns_planner_output(conn) -> None:
+    def column_exists(sync_conn) -> bool:
+        inspector = inspect(sync_conn)
+        if "turns" not in inspector.get_table_names():
+            return False
+        return any(
+            column["name"] == "planner_output"
+            for column in inspector.get_columns("turns")
+        )
+
+    if await conn.run_sync(column_exists):
+        return
+
+    alter_statement = "ALTER TABLE turns ADD COLUMN planner_output JSON"
+    if conn.dialect.name != "sqlite":
+        alter_statement = "ALTER TABLE turns ADD COLUMN IF NOT EXISTS planner_output JSON"
+
+    await conn.execute(text(alter_statement))
+
+
+async def initialise_database() -> None:
+    async with database.engine.begin() as conn:
+        await conn.run_sync(database.Base.metadata.create_all)
+        await ensure_turns_planner_output(conn)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(
-            text("ALTER TABLE turns ADD COLUMN IF NOT EXISTS planner_output JSON")
-        )
+    await initialise_database()
     redis = Redis.from_env()
     yield
 
@@ -197,7 +219,7 @@ async def close_session_trajectory(
 @app.post("/session", response_model=SessionResponse)
 async def create_session(
     req: CreateSessionRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(database.get_db)
 ):
     db_session = DBSession(user_id=req.user_id, language=req.language)
     db.add(db_session)
@@ -217,7 +239,7 @@ async def create_session(
 @app.post("/classify", response_model=TurnResponse)
 async def classify_emotion(
     req: ClassifyRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(database.get_db)
 ):
     request_started = perf_counter()
 
@@ -355,7 +377,7 @@ async def classify_emotion(
 # ─── /session/{id} GET ────────────────────────────────────────────────────────
 
 @app.get("/session/{session_id}", response_model=SessionHistoryResponse)
-async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
+async def get_session(session_id: str, db: AsyncSession = Depends(database.get_db)):
     result = await db.execute(
         select(DBSession)
         .where(DBSession.id == session_id)
@@ -389,7 +411,7 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
 # ─── /session/{id} DELETE ─────────────────────────────────────────────────────
 
 @app.delete("/session/{session_id}")
-async def delete_session(session_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_session(session_id: str, db: AsyncSession = Depends(database.get_db)):
     result = await db.execute(
         select(DBSession).where(DBSession.id == session_id)
     )
@@ -425,7 +447,7 @@ async def delete_session(session_id: str, db: AsyncSession = Depends(get_db)):
 # without deleting the session record or turn history.
 
 @app.post("/session/{session_id}/close")
-async def close_session(session_id: str, db: AsyncSession = Depends(get_db)):
+async def close_session(session_id: str, db: AsyncSession = Depends(database.get_db)):
     result = await db.execute(
         select(DBSession).where(DBSession.id == session_id)
     )
@@ -463,7 +485,7 @@ async def close_session(session_id: str, db: AsyncSession = Depends(get_db)):
 # ─── /user/{user_id}/profile GET ──────────────────────────────────────────────
 
 @app.get("/user/{user_id}/profile")
-async def get_user_profile(user_id: str, db: AsyncSession = Depends(get_db)):
+async def get_user_profile(user_id: str, db: AsyncSession = Depends(database.get_db)):
     result = await db.execute(
         select(UserEmotionalProfile).where(UserEmotionalProfile.user_id == user_id)
     )
