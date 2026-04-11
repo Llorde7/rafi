@@ -4,30 +4,31 @@ import logging
 from time import perf_counter
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import inspect, select, text
+from sqlalchemy import select, text
 from sqlalchemy.orm import selectinload
 from contextlib import asynccontextmanager
 from datetime import datetime
 from dotenv import load_dotenv
 from upstash_redis.asyncio import Redis
 
-import database
+from database import engine, get_db, Base
 from models import Session as DBSession, Turn, UserEmotionalProfile
 from contracts.causal_contract import HistoryTurn
 from contracts.pipeline_envelope import PipelineEnvelope
 from contracts.trajectory_contract import SessionTrajectory, TrajectoryFlag
+from contracts.trace_contract import TraceTurn, TonePreference, DetectedLanguage
+from contracts.session_framework_contract import SessionFramework
 from schemas import (
     ClassifyRequest,
     CreateSessionRequest,
     SessionHistoryResponse,
     SessionResponse,
     TurnResponse,
+    TraceResult,
 )
 from orchestrator import (
     run_pipeline,
     build_history_turn,
-    advance_trajectory,
-    get_escalation_flag,
 )
 
 load_dotenv()
@@ -39,36 +40,20 @@ logger = logging.getLogger(__name__)
 redis: Redis = None
 
 
-async def ensure_turns_planner_output(conn) -> None:
-    def column_exists(sync_conn) -> bool:
-        inspector = inspect(sync_conn)
-        if "turns" not in inspector.get_table_names():
-            return False
-        return any(
-            column["name"] == "planner_output"
-            for column in inspector.get_columns("turns")
-        )
-
-    if await conn.run_sync(column_exists):
-        return
-
-    alter_statement = "ALTER TABLE turns ADD COLUMN planner_output JSON"
-    if conn.dialect.name != "sqlite":
-        alter_statement = "ALTER TABLE turns ADD COLUMN IF NOT EXISTS planner_output JSON"
-
-    await conn.execute(text(alter_statement))
-
-
-async def initialise_database() -> None:
-    async with database.engine.begin() as conn:
-        await conn.run_sync(database.Base.metadata.create_all)
-        await ensure_turns_planner_output(conn)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis
-    await initialise_database()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text("ALTER TABLE turns ADD COLUMN IF NOT EXISTS planner_output JSON")
+        )
+        await conn.execute(
+            text("ALTER TABLE turns ADD COLUMN IF NOT EXISTS trace_output JSON")
+        )
+        await conn.execute(
+            text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tone_preference VARCHAR DEFAULT 'friendly'")
+        )
     redis = Redis.from_env()
     yield
 
@@ -94,6 +79,18 @@ async def get_causal_history(session_id: str) -> list[HistoryTurn]:
 async def get_cached_trajectory(session_id: str) -> SessionTrajectory | None:
     raw = await redis.get(f"session:{session_id}:trajectory")
     return SessionTrajectory(**json.loads(raw)) if raw else None
+
+
+async def get_trace_history(session_id: str) -> list[TraceTurn]:
+    raw = await redis.get(f"session:{session_id}:trace_history")
+    if not raw:
+        return []
+    return [TraceTurn(**t) for t in json.loads(raw)]
+
+
+async def get_session_tone(session_id: str) -> TonePreference:
+    raw = await redis.get(f"session:{session_id}:tone")
+    return TonePreference(raw) if raw else TonePreference.FRIENDLY
 
 
 async def get_trajectory(session_id: str, user_id: str | None, db: AsyncSession) -> SessionTrajectory:
@@ -127,6 +124,8 @@ async def save_all_histories(
     classifier_history: list[dict],
     causal_history: list[HistoryTurn],
     trajectory: SessionTrajectory,
+    trace_history: list[TraceTurn],
+    session_framework: SessionFramework,
 ):
     await asyncio.gather(
         redis.setex(
@@ -143,6 +142,16 @@ async def save_all_histories(
             f"session:{session_id}:trajectory",
             SESSION_META_TTL,
             trajectory.model_dump_json()
+        ),
+        redis.setex(
+            f"session:{session_id}:trace_history",
+            SESSION_META_TTL,
+            json.dumps([t.model_dump() for t in trace_history[-6:]])
+        ),
+        redis.setex(
+            f"session:{session_id}:session_framework",
+            SESSION_META_TTL,
+            session_framework.model_dump_json()
         ),
     )
 
@@ -219,17 +228,29 @@ async def close_session_trajectory(
 @app.post("/session", response_model=SessionResponse)
 async def create_session(
     req: CreateSessionRequest,
-    db: AsyncSession = Depends(database.get_db)
+    db: AsyncSession = Depends(get_db)
 ):
-    db_session = DBSession(user_id=req.user_id, language=req.language)
+    db_session = DBSession(
+        user_id=req.user_id,
+        language=req.language,
+        tone_preference=req.tone_preference,
+    )
     db.add(db_session)
     await db.commit()
     await db.refresh(db_session)
+
+    # Cache tone in Redis for fast access during pipeline calls
+    await redis.setex(
+        f"session:{db_session.id}:tone",
+        SESSION_META_TTL,
+        req.tone_preference,
+    )
 
     return SessionResponse(
         session_id=db_session.id,
         user_id=db_session.user_id,
         language=db_session.language,
+        tone_preference=db_session.tone_preference,
         created_at=db_session.created_at
     )
 
@@ -239,7 +260,7 @@ async def create_session(
 @app.post("/classify", response_model=TurnResponse)
 async def classify_emotion(
     req: ClassifyRequest,
-    db: AsyncSession = Depends(database.get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     request_started = perf_counter()
 
@@ -266,16 +287,22 @@ async def classify_emotion(
 
     # ── Load histories ────────────────────────────────────────────────────────
     history_started = perf_counter()
-    classifier_history, causal_history, cached_trajectory = await asyncio.gather(
+    classifier_history, causal_history, cached_trajectory, trace_history, tone_preference = await asyncio.gather(
         get_classifier_history(session_id_str),
         get_causal_history(session_id_str),
         get_cached_trajectory(session_id_str),
+        get_trace_history(session_id_str),
+        get_session_tone(session_id_str),
     )
     trajectory = (
         cached_trajectory
         if cached_trajectory is not None
         else await get_trajectory(session_id_str, user_id, db)
     )
+
+    # Session framework is persisted per-session (Redis). For now, default to
+    # pre-framework mode when not found.
+    session_framework = SessionFramework()
     logger.info(
         "API timing | session_id=%s stage=load_histories duration_ms=%.1f",
         session_id_str,
@@ -284,27 +311,41 @@ async def classify_emotion(
 
     # ── Run pipeline ──────────────────────────────────────────────────────────
     pipeline_started = perf_counter()
-    envelope: PipelineEnvelope = await run_pipeline(
+
+    # Build cross-session summary string if user has a prior profile
+    cross_session_summary: str | None = None
+    if user_id:
+        profile_result = await db.execute(
+            select(UserEmotionalProfile).where(UserEmotionalProfile.user_id == user_id)
+        )
+        profile = profile_result.scalar_one_or_none()
+        if profile and profile.sessions_seen > 0:
+            cross_session_summary = (
+                f"This user has had {profile.sessions_seen} prior session(s). "
+                f"Their average emotional valence across sessions is {profile.mean_valence:.2f} "
+                f"(range -1.0 negative to 1.0 positive). "
+                f"Their most common stressor patterns have been: {', '.join(profile.dominant_cause_types[:3])}. "
+                f"Their last session ended with a trajectory flag of '{profile.last_session_flag}' "
+                f"and dominant emotion of '{profile.last_session_end_emotion}'."
+            )
+
+    envelope, updated_trajectory, updated_session_framework = await run_pipeline(
         text=req.text,
         session_id=session_id_str,
         user_id=user_id,
         classifier_history=classifier_history,
         causal_history=causal_history,
         trajectory=trajectory,
+        session_framework=session_framework,
+        tone_preference=tone_preference,
+        trace_history=trace_history,
+        cross_session_summary=cross_session_summary,
     )
     logger.info(
         "API timing | session_id=%s stage=pipeline duration_ms=%.1f",
         session_id_str,
         (perf_counter() - pipeline_started) * 1000,
     )
-
-    # ── Advance trajectory ────────────────────────────────────────────────────
-    updated_trajectory = advance_trajectory(trajectory, envelope)
-
-    # ── Check for actionable flags ────────────────────────────────────────────
-    escalation_flag = get_escalation_flag(updated_trajectory)
-    # TODO: when MIND-SAFE is integrated, pass escalation_flag into it here.
-    # For now it is available on the envelope for downstream consumers.
 
     # ── Persist turn ──────────────────────────────────────────────────────────
     db_started = perf_counter()
@@ -318,6 +359,10 @@ async def classify_emotion(
         planner_output=(
             envelope.planner_output.model_dump(mode="json")
             if envelope.planner_output else None
+        ),
+        trace_output=(
+            envelope.trace_output.model_dump(mode="json")
+            if envelope.trace_output else None
         ),
     )
     db.add(turn)
@@ -340,12 +385,23 @@ async def classify_emotion(
     })
     causal_history.append(new_history_turn)
 
+    # Append to trace history only if TRACE ran (not escalated)
+    if envelope.trace_output and not envelope.trace_output.error:
+        trace_history.append(TraceTurn(
+            student_text=req.text,
+            trace_response=envelope.trace_output.response_text,
+            strategy_used=envelope.trace_output.strategy_used,
+            turn_number=updated_trajectory.turn_count + 1,
+        ))
+
     redis_started = perf_counter()
     await save_all_histories(
         session_id_str,
         classifier_history,
         causal_history,
         updated_trajectory,
+        trace_history,
+        updated_session_framework,
     )
     logger.info(
         "API timing | session_id=%s stage=redis_save duration_ms=%.1f",
@@ -370,6 +426,10 @@ async def classify_emotion(
             envelope.planner_output.model_dump(mode="json")
             if envelope.planner_output else None
         ),
+        trace_output=(
+            envelope.trace_output.model_dump(mode="json")
+            if envelope.trace_output else None
+        ),
         created_at=turn.created_at
     )
 
@@ -377,7 +437,7 @@ async def classify_emotion(
 # ─── /session/{id} GET ────────────────────────────────────────────────────────
 
 @app.get("/session/{session_id}", response_model=SessionHistoryResponse)
-async def get_session(session_id: str, db: AsyncSession = Depends(database.get_db)):
+async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(DBSession)
         .where(DBSession.id == session_id)
@@ -401,6 +461,7 @@ async def get_session(session_id: str, db: AsyncSession = Depends(database.get_d
                 reasoning=t.reasoning,
                 causal_analysis=t.causal_analysis,
                 planner_output=t.planner_output,
+                trace_output=t.trace_output,
                 created_at=t.created_at
             )
             for t in db_session.turns
@@ -411,7 +472,7 @@ async def get_session(session_id: str, db: AsyncSession = Depends(database.get_d
 # ─── /session/{id} DELETE ─────────────────────────────────────────────────────
 
 @app.delete("/session/{session_id}")
-async def delete_session(session_id: str, db: AsyncSession = Depends(database.get_db)):
+async def delete_session(session_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(DBSession).where(DBSession.id == session_id)
     )
@@ -437,6 +498,8 @@ async def delete_session(session_id: str, db: AsyncSession = Depends(database.ge
     await redis.delete(f"session:{session_id}:classifier_history")
     await redis.delete(f"session:{session_id}:causal_history")
     await redis.delete(f"session:{session_id}:trajectory")
+    await redis.delete(f"session:{session_id}:trace_history")
+    await redis.delete(f"session:{session_id}:tone")
 
     return {"deleted": session_id}
 
@@ -447,7 +510,7 @@ async def delete_session(session_id: str, db: AsyncSession = Depends(database.ge
 # without deleting the session record or turn history.
 
 @app.post("/session/{session_id}/close")
-async def close_session(session_id: str, db: AsyncSession = Depends(database.get_db)):
+async def close_session(session_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(DBSession).where(DBSession.id == session_id)
     )
@@ -473,6 +536,8 @@ async def close_session(session_id: str, db: AsyncSession = Depends(database.get
     await redis.delete(f"session:{session_id}:classifier_history")
     await redis.delete(f"session:{session_id}:causal_history")
     await redis.delete(f"session:{session_id}:trajectory")
+    await redis.delete(f"session:{session_id}:trace_history")
+    await redis.delete(f"session:{session_id}:tone")
 
     return {
         "status": "closed",
@@ -485,7 +550,7 @@ async def close_session(session_id: str, db: AsyncSession = Depends(database.get
 # ─── /user/{user_id}/profile GET ──────────────────────────────────────────────
 
 @app.get("/user/{user_id}/profile")
-async def get_user_profile(user_id: str, db: AsyncSession = Depends(database.get_db)):
+async def get_user_profile(user_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(UserEmotionalProfile).where(UserEmotionalProfile.user_id == user_id)
     )

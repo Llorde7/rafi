@@ -53,6 +53,12 @@ class PlannerInput(BaseModel):
     turn_count: int
     cross_session_baseline: Optional[float]
 
+    # ── Session framework ─────────────────────────────────────────────────────
+    session_framework: str              # TherapeuticFramework.value
+    session_framework_is_set: bool      # False = pre-framework mode
+    session_framework_locked: bool      # True = within cooldown, cannot change
+    session_framework_change_count: int # how many times it has changed
+
 
 class PlannerOutput(BaseModel):
     framework: TherapeuticFramework

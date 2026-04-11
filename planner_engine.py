@@ -18,6 +18,7 @@ The planner may override it if it has a more targeted one.
 import os
 import json
 import logging
+import re
 from time import perf_counter
 from groq import Groq
 from dotenv import load_dotenv
@@ -31,6 +32,15 @@ load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL  = "llama-3.3-70b-versatile"
 logger = logging.getLogger(__name__)
+
+INTERPERSONAL_CONTEXT_PATTERNS = (
+    r"\bwhat (?:did|happened|happen)\b",
+    r"\bwas (?:it|what he did|what she did|what they did) right\b",
+    r"\bforgive\b",
+    r"\bpay for this\b",
+    r"\brevenge\b",
+    r"\bmad at (?:him|her|them)\b",
+)
 
 
 # ─── System prompt ────────────────────────────────────────────────────────────
@@ -46,10 +56,10 @@ You select a therapeutic framework and a response strategy. Your output feeds TR
 
 YOUR FRAMEWORKS:
 - cbt: Use when there is evidence of distorted thinking, catastrophising, all-or-nothing beliefs, or self-critical cognitions. Best for cause_type=cognitive_distortion.
-- mi: Use when the student is ambivalent, avoiding change, or expressing desire without action. Best for avoidance_behaviour or identity_threat.
+- mi: Use when the student is ambivalent, avoiding change, or expressing desire without action. Best for avoidance_behaviour or identity_threat. Also use when a student proposes an escape plan with a return intention ("I'll quit and come back") — this signals ambivalence about their situation, not a fixed decision. MI surfaces their own reasoning rather than reinforcing the avoidance.
 - solution_focused: Use when the student has prior coping capacity or trajectory is de-escalating. Surfaces strengths, not deficits.
 - person_centred: Use when the student needs unconditional positive regard — grief, loss, shame, or when causal confidence is low. No technique. Presence first.
-- none: Use when trajectory_flag is escalating/sustained_negative/arousal_spike AND arousal is high. Active listening only. Do not attempt technique on a dysregulated student.
+- none: Use ONLY when the student's message itself shows observable signs of dysregulation — incoherence, fragmented sentences, extreme distress language, or inability to engage. A trajectory flag alone is not sufficient to choose none. If the student is still articulate and engaging, they can receive a technique.
 
 YOUR STRATEGIES:
 - validate: Acknowledge and normalise the emotion explicitly. Best for grief, fear, shame.
@@ -57,7 +67,7 @@ YOUR STRATEGIES:
 - reframe: Offer an alternative cognitive lens. Only after validation. Only when causal confidence >= 0.65.
 - probe: Ask a targeted follow-up. Use when causal confidence is partial/insufficient.
 - psychoeducate: Brief normalising information + relevant university support resources. Use when the student needs factual context about what support exists.
-- active_listen: Stay present. No directive. Use when hold is received AND you agree, or arousal is very high.
+- active_listen: Stay present. No directive. Reserve this for when the student is genuinely too distressed to engage with any technique — observable in their message, not just inferred from trajectory flags.
 - motivate: Elicit change talk. MI only.
 - solution_elicit: Surface existing strengths. Solution-focused only.
 
@@ -74,8 +84,8 @@ CAUSAL PLANNER INSTRUCTION (advisory only — you may override with justificatio
 - hold: Contradictory signals detected. Treat as advice. You can still select a technique if trajectory gives you a clearer picture — justify any override in rationale.
 
 TRAJECTORY SIGNALS:
-- escalating / sustained_negative: Reduce ambition. No reframe. Prefer validate + person_centred or none.
-- arousal_spike: High arousal this turn. Active listening only. No CBT.
+- escalating / sustained_negative: Reduce ambition. No reframe. Prefer validate + person_centred or none. But only choose none if the student's message confirms they cannot engage.
+- arousal_spike: High arousal detected. Prefer validate or reflect. Only use active_listen if the student's language is genuinely fragmented or overwhelmed — a coherent, articulate message does not warrant active_listen even under arousal_spike.
 - de-escalating: Student stabilising. Solution_focused is now available.
 - emotion_shift: Sharp transition occurred. Prefer reflect before committing to technique.
 - suppression: Student may be underreporting distress. Probe gently.
@@ -88,9 +98,12 @@ CLARIFYING QUESTION:
 - A good override is concrete: "You mentioned stopping your classes — was that this week or longer?" not "Can you tell me more?"
 - If strategy is not probe and causal question is adequate, always inherit.
 
-ESCALATION:
-- Set escalate_to_safety=true if: sustained_negative AND arousal is high, OR if global_cause contains themes of hopelessness, self-harm, or harm to others.
-- escalation_reason must be a brief clinical note, not a restatement of the flag.
+ESCALATION — READ THIS CAREFULLY:
+- escalate_to_safety=true ONLY when the student's message contains explicit or strongly implied themes of: suicidal ideation, self-harm, harm to others, or acute hopelessness about continuing to live.
+- Considering a break from school, quitting, withdrawing, or taking time off is NOT an escalation trigger. These are coping considerations, not crisis signals.
+- Expressions of being overwhelmed, exhausted, or wanting to escape academic pressure are NOT escalation triggers.
+- When in doubt, do not escalate. A false escalation is worse than a missed one for mild signals — the hard guard in code will catch genuine trajectory-based crises.
+- escalation_reason must be a specific clinical note referencing exact language from the student's message, not a restatement of trajectory flags.
 
 RESPONSE DIRECTIVE:
 - One to two sentences. Tells TRACE exactly what to do.
@@ -174,6 +187,72 @@ def _safe_fallback(inp: PlannerInput, error: str) -> PlannerOutput:
     )
 
 
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized or normalized.lower() == "null":
+        return None
+    return normalized
+
+
+def _needs_context_probe(inp: PlannerInput, strategy: ResponseStrategy) -> bool:
+    if inp.cause_type != "interpersonal_conflict":
+        return False
+    if inp.current_arousal == "high":
+        return False
+    if strategy == ResponseStrategy.PROBE:
+        return False
+
+    lowered = inp.text.lower()
+    refers_to_other = bool(re.search(r"\b(he|him|she|her|they|them)\b", lowered))
+    asks_for_judgment_or_forgiveness = any(
+        re.search(pattern, lowered) for pattern in INTERPERSONAL_CONTEXT_PATTERNS
+    )
+    lacks_specific_event_detail = len(lowered.split()) <= 14 or not re.search(
+        r"\b(?:because|after|when|since)\b", lowered
+    )
+
+    return refers_to_other and asks_for_judgment_or_forgiveness and lacks_specific_event_detail
+
+
+def _build_context_probe_question(text: str) -> str:
+    lowered = text.lower()
+    if "forgive" in lowered:
+        return "When you think about forgiving him, what exactly did he do that still feels hardest to move past?"
+    if "right" in lowered:
+        return "When you ask whether what he did was right, what exactly happened that felt wrong to you?"
+    return "What exactly happened between you and him that hurt you this much?"
+
+
+def _apply_context_probe_override(inp: PlannerInput, output: PlannerOutput) -> PlannerOutput:
+    if not _needs_context_probe(inp, output.strategy):
+        return output
+
+    question = _build_context_probe_question(inp.text)
+    return PlannerOutput(
+        framework=TherapeuticFramework.PERSON_CENTRED,
+        strategy=ResponseStrategy.PROBE,
+        planner_confidence=PlannerConfidence.MEDIUM,
+        rationale=(
+            "The student is asking for judgement or forgiveness guidance without enough concrete "
+            "context about the interpersonal harm. A gentle probe is needed before more meaningful help."
+        ),
+        clarifying_question=question,
+        clarifying_question_overridden=True,
+        response_directive=(
+            "Use person-centred probing. Briefly acknowledge the hurt, then ask the targeted "
+            "clarifying question so the student can name what happened before you explore meaning or forgiveness."
+        ),
+        escalate_to_safety=output.escalate_to_safety,
+        escalation_reason=output.escalation_reason,
+        kb_context=output.kb_context,
+        kb_sources=output.kb_sources,
+        kb_retrieval_attempted=output.kb_retrieval_attempted,
+        error=output.error,
+    )
+
+
 # ─── Sync planner (no RAG) ────────────────────────────────────────────────────
 
 def plan(inp: PlannerInput) -> PlannerOutput:
@@ -214,8 +293,8 @@ def plan(inp: PlannerInput) -> PlannerOutput:
             confidence = PlannerConfidence.LOW
 
         # ── Clarifying question ───────────────────────────────────────────────
-        llm_question = data.get("clarifying_question")
-        inherited    = inp.clarifying_question
+        llm_question = _normalize_optional_text(data.get("clarifying_question"))
+        inherited    = _normalize_optional_text(inp.clarifying_question)
         overridden   = bool(
             data.get("clarifying_question_overridden", False)
             or (llm_question and llm_question != inherited)
@@ -223,13 +302,27 @@ def plan(inp: PlannerInput) -> PlannerOutput:
         final_question = llm_question or inherited
 
         # ── Hard escalation guard ─────────────────────────────────────────────
-        # Force escalation if sustained negative + high arousal regardless of LLM
+        # Force escalation only when trajectory AND arousal AND valence are all
+        # severe. This is a safety net for when the LLM misses genuine crisis
+        # signals — it is not meant to fire on ordinary academic distress.
+        # "escalating" + high arousal alone is too broad; require valence < -0.6
+        # for escalating, and keep sustained_negative at < -0.5 as it implies
+        # multiple consecutive turns of severe distress.
+        # Layer 1 (keyword scan) will catch explicit crisis language before this.
         force_escalate = (
-            inp.trajectory_flag in ("sustained_negative", "escalating")
-            and inp.current_arousal == "high"
+            (
+                inp.trajectory_flag == "sustained_negative"
+                and inp.current_arousal == "high"
+                and inp.current_valence < -0.5
+            )
+            or (
+                inp.trajectory_flag == "escalating"
+                and inp.current_arousal == "high"
+                and inp.current_valence < -0.6
+            )
         )
         escalate = data.get("escalate_to_safety", False) or force_escalate
-        escalation_reason = data.get("escalation_reason")
+        escalation_reason = _normalize_optional_text(data.get("escalation_reason"))
         if force_escalate and not escalation_reason:
             escalation_reason = (
                 f"Auto-escalated: trajectory_flag={inp.trajectory_flag}, "
@@ -243,7 +336,7 @@ def plan(inp: PlannerInput) -> PlannerOutput:
             strategy  = ResponseStrategy.ACTIVE_LISTEN
             framework = TherapeuticFramework.NONE
 
-        return PlannerOutput(
+        output = PlannerOutput(
             framework=framework,
             strategy=strategy,
             planner_confidence=confidence,
@@ -254,6 +347,7 @@ def plan(inp: PlannerInput) -> PlannerOutput:
             escalate_to_safety=escalate,
             escalation_reason=escalation_reason,
         )
+        return _apply_context_probe_override(inp, output)
 
     except Exception as e:
         return _safe_fallback(inp, str(e))

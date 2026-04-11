@@ -17,11 +17,13 @@ class ClassifyRequest(BaseModel):
 class CreateSessionRequest(BaseModel):
     user_id: Optional[str] = None
     language: str = "en"
+    tone_preference: str = "friendly"   # "friendly" | "clinical"
 
 class SessionResponse(BaseModel):
     session_id: UUID
     user_id: Optional[str]
     language: str
+    tone_preference: str
     created_at: datetime
 
 
@@ -60,6 +62,15 @@ class PlannerResult(BaseModel):
     error: Optional[str] = None
 
 
+class TraceResult(BaseModel):
+    response_text:         str
+    strategy_used:         str
+    language:              str
+    contains_clarifying_q: bool = False
+    trace_confidence:      str
+    error:                 Optional[str] = None
+
+
 class TurnResponse(BaseModel):
     turn_id: UUID
     session_id: UUID
@@ -69,6 +80,7 @@ class TurnResponse(BaseModel):
     reasoning: str
     causal_analysis: Optional[CausalAnalysis] = None
     planner_output: Optional[PlannerResult] = None
+    trace_output: Optional[TraceResult] = None
     created_at: datetime
 
 

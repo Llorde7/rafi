@@ -36,13 +36,19 @@ CONFIDENCE SCORING:
   (contradictory overrides the score — flag it regardless of numeric confidence)
 
 CAUSE TYPES (tag the psychological territory — do not select a therapeutic technique):
-- cognitive_distortion: distorted belief, catastrophising, all-or-nothing thinking
-- avoidance_behaviour: avoidance, suppression, incomplete action, withdrawal
+- cognitive_distortion: distorted belief, catastrophising, all-or-nothing thinking, catastrophic predictions about outcomes
+- avoidance_behaviour: avoidance, suppression, incomplete action, withdrawal, escape planning, proposing a temporary exit from a situation with intention to return — the student is moving away from the stressor rather than through it
 - unresolved_loss: grief, absence, attachment disruption
 - somatic_response: physical sensation carrying emotional signal
 - interpersonal_conflict: relational tension, betrayal, neglect, boundary violation
 - identity_threat: self-concept under threat, shame, inadequacy, role loss
 - ambiguous: cannot determine from available text
+
+AVOIDANCE vs COGNITIVE DISTORTION — common confusion:
+- "I want to quit and come back later" = avoidance_behaviour (escape plan with return intention)
+- "I'll never be able to handle this" = cognitive_distortion (distorted belief about capacity)
+- "I'm just not cut out for this" = identity_threat (self-concept under threat)
+- When a student proposes a concrete behavioural exit (quitting, withdrawing, taking a break), that is avoidance_behaviour regardless of the emotions present.
 
 PLANNER INSTRUCTION:
 - "proceed": confident — planner may select technique

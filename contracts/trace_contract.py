@@ -61,7 +61,10 @@ class TraceInput(BaseModel):
 
 class TraceOutput(BaseModel):
     response_text:          str
-    strategy_used:          str                  # echoes planner strategy
+    strategy_used:          str                  # what TRACE actually used — may differ from planner
+    planner_strategy:       str                  # what the planner suggested
+    strategy_overridden:    bool = False          # True if TRACE deviated
+    override_reason:        Optional[str] = None  # why TRACE deviated
     language:               DetectedLanguage     # language TRACE responded in
     contains_clarifying_q:  bool = False         # True if question was woven in
     trace_confidence:       TraceConfidence = TraceConfidence.HIGH
