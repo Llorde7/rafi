@@ -5,6 +5,38 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 import os
+import ssl
+
+
+def _build_ssl_context(verify: bool = True) -> ssl.SSLContext:
+    """
+    Build an SSL context for asyncpg.
+
+    By default uses the system CA bundle (certifi if installed, then
+    fall back to ssl.create_default_context()). If verify=False, disables
+    certificate verification (insecure — use only for diagnostics or trusted
+    internal networks).
+
+    The context is explicitly used as `ssl=ctx` in connect_args so that
+    asyncpg does not silently fall back to its own default (which is
+    `ssl=True` with no CA file, causing "self-signed certificate in
+    certificate chain" errors on hosts that present a CA-signed cert
+    chain that Python cannot locate).
+    """
+    if not verify:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    # Prefer certifi's CA bundle if installed (most reliable on minimal
+    # container images that lack /etc/ssl/certs).
+    try:
+        import certifi  # type: ignore
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+    return ctx
 
 load_dotenv()
 
@@ -38,6 +70,11 @@ else:
 host = (parsed.hostname or "").lower()
 needs_ssl = host not in ("localhost", "127.0.0.1", "::1") and host != ""
 
+# Build the SSL context. Set DB_SSL_DISABLE=1 to skip cert verification
+# (only use for local development or trusted internal networks).
+ssl_verify = os.getenv("DB_SSL_DISABLE", "0") not in ("1", "true", "True")
+ssl_ctx = _build_ssl_context(verify=ssl_verify) if needs_ssl else None
+
 if ":5432" in DATABASE_URL:
     connect_args = {
         "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
@@ -47,8 +84,8 @@ if ":5432" in DATABASE_URL:
             "statement_timeout": "60000",
         },
     }
-    if needs_ssl:
-        connect_args["ssl"] = True
+    if ssl_ctx is not None:
+        connect_args["ssl"] = ssl_ctx
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
@@ -63,8 +100,8 @@ else:
         DATABASE_URL + sep + "prepared_statement_cache_size=0"
     )
     connect_args = {"timeout": 10}
-    if needs_ssl:
-        connect_args["ssl"] = True
+    if ssl_ctx is not None:
+        connect_args["ssl"] = ssl_ctx
     engine = create_async_engine(
         url_with_cache_off,
         echo=False,
