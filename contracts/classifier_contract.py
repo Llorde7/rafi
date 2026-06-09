@@ -27,7 +27,6 @@ class GoEmotionLabel(str, Enum):
     NERVOUSNESS = "nervousness"
     NEUTRAL = "neutral"
     OPTIMISM = "optimism"
-    FRUSTRATION = "frustration"
     PRIDE = "pride"
     REALIZATION = "realization"
     RELIEF = "relief"
