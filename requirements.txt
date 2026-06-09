@@ -5,6 +5,7 @@ asyncpg
 upstash-redis
 python-dotenv
 groq
+google-genai
 pydantic
 qdrant-client
 fastembed

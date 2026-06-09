@@ -29,6 +29,8 @@ class Turn(Base):
     causal_analysis = Column(JSON, nullable=True)
     planner_output  = Column(JSON, nullable=True)
     trace_output    = Column(JSON, nullable=True)    # TraceOutput — student-facing response
+    scope_category  = Column(String, nullable=True)  # Scope category from scope guard
+    scope_confidence = Column(Float, nullable=True)  # Scope guard confidence score
     created_at      = Column(DateTime, default=datetime.utcnow)
     session         = relationship("Session", back_populates="turns")
 

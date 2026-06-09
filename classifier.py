@@ -1,119 +1,173 @@
 import json
-import logging
 import os
+from typing import Optional
+from pydantic import BaseModel
+from groq import AsyncGroq
+from contracts.classifier_contract import ClassifierInput, EmotionScore
+from contracts.situation_contract import SituationType, SituationOutput
 
-from groq import Groq
-from dotenv import load_dotenv
+MODEL  = "llama-3.3-70b-versatile"
 
-from contracts.classifier_contract import ClassifierOutput
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Lazy client — reads GROQ_API_KEY from env at first call, after load_dotenv()
+# ---------------------------------------------------------------------------
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL = "llama-3.3-70b-versatile"
-logger = logging.getLogger(__name__)
+_client: AsyncGroq | None = None
 
-SYSTEM_PROMPT = """You are a fast emotion classifier using the GoEmotions 28-label taxonomy.
+def _get_client() -> AsyncGroq:
+    global _client
+    if _client is None:
+        _client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
+    return _client
 
-ALLOWED LABELS (exactly these 28):
+
+# ---------------------------------------------------------------------------
+# Fused output contract — classifier + situation in one call
+# ---------------------------------------------------------------------------
+
+class Stage1Output(BaseModel):
+    # Classifier fields
+    text:         str
+    translation:  Optional[str]
+    top_3:        list[EmotionScore]
+    reasoning:    str
+    # Situation fields
+    situation_type:          SituationType
+    situation_summary:       str
+    has_concrete_deadline:   bool
+    has_external_referents:  bool
+    situation_confidence:    float
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are an expert clinical psychologist and emotion analyst specialising in university student mental health in Kenya.
+
+You receive a student's message and recent session history.
+You must produce two analyses in a single JSON response: emotion classification and situation assessment.
+
+═══════════════════════════════════════════
+PART 1 — EMOTION CLASSIFICATION
+═══════════════════════════════════════════
+
+Use the GoEmotions 28-label taxonomy:
 admiration, amusement, anger, annoyance, approval, caring, confusion, curiosity,
 desire, disappointment, disapproval, disgust, embarrassment, excitement, fear,
-gratitude, grief, joy, love, nervousness, neutral, optimism, pride, realization,
-relief, remorse, sadness, surprise
+gratitude, grief, joy, love, nervousness, optimism, pride, realization, relief,
+remorse, sadness, surprise, neutral
 
-RULES:
-1. Top 3 emotions only. Never invent labels.
-2. Confidence scores: 0.01–0.99, sum to exactly 1.0.
-3. Classify implied behaviour, not literal words.
-4. Return ONLY valid JSON. No markdown, no preamble.
+IMPLICIT EMOTION GUIDE
+Implicit emotions are carried by behaviour and situation, not feeling words.
+Classify the underlying emotional state — not the surface description.
+Examples:
+- "I keep going to call him and then I remember" → grief, sadness
+- "I drove past the hospital and couldn't look" → grief, fear, avoidance
+- "I just need to get through the next few days" → nervousness, determination
 
-IMPLICIT GUIDE:
-repeated checking/rehearsing → nervousness/fear | two cups/cooking for two → grief
-letting calls ring out → remorse | smiling at nothing → joy
-credit taken for your work → anger | lights on all night → fear
+SWAHILI / SHENG / CODE-SWITCHING
+If the message is not in English, translate it first, then classify the English meaning.
+Populate the translation field with the English translation.
 
-EXAMPLES:
-{"top_3":[{"emotion":"grief","confidence":0.65},{"emotion":"sadness","confidence":0.25},{"emotion":"neutral","confidence":0.10}],"reasoning":"Reflex of reaching for someone gone signals grief."}
-{"top_3":[{"emotion":"nervousness","confidence":0.60},{"emotion":"fear","confidence":0.25},{"emotion":"confusion","confidence":0.15}],"reasoning":"Repeated composing and deleting signals hesitation from anxiety."}"""
+Output: top_3 emotions with confidence scores summing to 1.0. reasoning field: explain the classification in 1–2 sentences.
+
+═══════════════════════════════════════════
+PART 2 — SITUATION ASSESSMENT
+═══════════════════════════════════════════
+
+Classify the concrete circumstances of the student's situation — not their emotional state.
+
+SITUATION TYPES:
+- acute_task_crisis: imminent deadline, incomplete or failing deliverable, presentation/exam tomorrow
+- convergent_overload: multiple concurrent demands competing for limited time or capacity
+- interpersonal_event: a specific named interaction or conflict with another person
+- loss_or_absence: grief, separation, something or someone no longer present
+- identity_pressure: self-worth, shame, role or capability under threat
+- chronic_low_mood: persistent low state with no clear acute precipitating event
+- ambiguous: message does not provide enough situational information
+
+situation_summary: ONE sentence describing what is concretely happening.
+  CORRECT: "Student has a project presentation tomorrow and the project is incomplete."
+  WRONG: "Student is feeling anxious and overwhelmed."
+
+has_concrete_deadline: true ONLY if a specific time pressure is named (tomorrow, this week, in 2 days, etc.)
+has_external_referents: true if tasks, deliverables, people, places, or events are named
+situation_confidence: your confidence in the situation classification, 0.0–1.0
+
+═══════════════════════════════════════════
+OUTPUT FORMAT — STRICT
+═══════════════════════════════════════════
+
+Respond with a single JSON object. No preamble. No markdown fences.
+
+{
+  "translation": null,
+  "top_3": [
+    {"emotion": "<label>", "confidence": <float>},
+    {"emotion": "<label>", "confidence": <float>},
+    {"emotion": "<label>", "confidence": <float>}
+  ],
+  "reasoning": "<1-2 sentences>",
+  "situation_type": "<one of the 7 types>",
+  "situation_summary": "<one sentence — concrete facts only>",
+  "has_concrete_deadline": <true|false>,
+  "has_external_referents": <true|false>,
+  "situation_confidence": <float>
+}
+"""
 
 
-def compress_history(history: list[dict]) -> str:
+def _build_context_block(history: list[dict]) -> str:
     if not history:
         return ""
-    lines = []
+    lines = ["RECENT SESSION HISTORY (compressed):"]
     for h in history[-4:]:
-        top = h["top_3"][0]["emotion"] if h.get("top_3") else "neutral"
-        conf = h["top_3"][0]["confidence"] if h.get("top_3") else 0.0
-        lines.append(f'- "{h["text"][:60]}" → {top} ({conf:.2f})')
-    return "Prior turns:\n" + "\n".join(lines)
+        lines.append(
+            f"Turn {h.get('turn_index', '?')}: {h.get('text', '')} "
+            f"[emotion: {h.get('top_emotion', '?')}, "
+            f"situation: {h.get('situation_type', '?')}]"
+        )
+    return "\n".join(lines)
 
 
-def build_messages(text: str, history: list[dict]) -> list[dict]:
-    context = compress_history(history)
-    user_content = f'{context}\n\nClassify: "{text}"' if context else f'Classify: "{text}"'
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content}
-    ]
+async def classify(
+    inp: ClassifierInput,
+    classifier_history: list[dict],
+) -> Stage1Output:
+    client = _get_client()
+    context = _build_context_block(classifier_history)
+    user_content = inp.text
+    if context:
+        user_content = f"{context}\n\nCURRENT MESSAGE:\n{inp.text}"
 
-
-def _call_model(messages: list[dict], max_tokens: int) -> str:
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=MODEL,
-        messages=messages,
         temperature=0.1,
-        max_tokens=max_tokens,
+        max_tokens=600,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_content},
+        ],
     )
-    return response.choices[0].message.content.strip()
 
+    raw = response.choices[0].message.content.strip()
+    # Strip markdown fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    data = json.loads(raw.strip())
 
-def _extract_json_object(raw: str) -> dict:
-    cleaned = raw.replace("```json", "").replace("```", "").strip()
-    start, end = cleaned.index("{"), cleaned.rindex("}") + 1
-    return json.loads(cleaned[start:end])
-
-
-def _build_repair_messages(messages: list[dict], raw: str, error: Exception) -> list[dict]:
-    return messages + [
-        {"role": "assistant", "content": raw},
-        {
-            "role": "user",
-            "content": (
-                "Repair the previous response. Return only valid JSON with this shape: "
-                '{"top_3":[{"emotion":"<allowed GoEmotions label>","confidence":<float>}],'
-                '"reasoning":"<brief explanation>"} '
-                "Requirements: exactly 3 unique allowed labels, confidences between 0 and 1, "
-                "sorted descending, summing to 1.0. "
-                f"Validation error: {error}"
-            ),
-        },
-    ]
-
-
-def _validate_classifier_payload(text: str, data: dict) -> ClassifierOutput:
-    return ClassifierOutput(
-        text=text,
+    return Stage1Output(
+        text=inp.text,
         translation=data.get("translation"),
-        top_3=data["top_3"],
+        top_3=[EmotionScore(**e) for e in data["top_3"]],
         reasoning=data["reasoning"],
+        situation_type=SituationType(data["situation_type"]),
+        situation_summary=data["situation_summary"],
+        has_concrete_deadline=bool(data["has_concrete_deadline"]),
+        has_external_referents=bool(data["has_external_referents"]),
+        situation_confidence=float(data["situation_confidence"]),
     )
-
-
-def classify(text: str, history: list[dict] = None) -> ClassifierOutput:
-    messages = build_messages(text, history or [])
-
-    raw = _call_model(messages, max_tokens=200)
-    first_error: Exception | None = None
-    try:
-        return _validate_classifier_payload(text, _extract_json_object(raw))
-    except Exception as exc:
-        first_error = exc
-        logger.warning("Classifier parse/validation failed on first attempt: %s", exc)
-
-    repair_messages = _build_repair_messages(messages, raw, first_error)
-    repaired_raw = _call_model(repair_messages, max_tokens=220)
-    try:
-        return _validate_classifier_payload(text, _extract_json_object(repaired_raw))
-    except Exception:
-        logger.exception("Classifier parse/validation failed after repair attempt")
-        raise

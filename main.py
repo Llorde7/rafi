@@ -3,6 +3,7 @@ import json
 import logging
 from time import perf_counter
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from sqlalchemy.orm import selectinload
@@ -16,20 +17,17 @@ from models import Session as DBSession, Turn, UserEmotionalProfile
 from contracts.causal_contract import HistoryTurn
 from contracts.pipeline_envelope import PipelineEnvelope
 from contracts.trajectory_contract import SessionTrajectory, TrajectoryFlag
-from contracts.trace_contract import TraceTurn, TonePreference, DetectedLanguage
+from contracts.trace_contract import TraceTurn, TonePreference
 from contracts.session_framework_contract import SessionFramework
+from contracts.intent_contract import IntentState
 from schemas import (
     ClassifyRequest,
     CreateSessionRequest,
     SessionHistoryResponse,
     SessionResponse,
     TurnResponse,
-    TraceResult,
 )
-from orchestrator import (
-    run_pipeline,
-    build_history_turn,
-)
+from orchestrator import run_pipeline
 
 load_dotenv()
 logging.basicConfig(
@@ -60,51 +58,86 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="EmpathAI", lifespan=lifespan)
 
+# Enable CORS for frontend-backend communication
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ─── Redis helpers ─────────────────────────────────────────────────────────────
 SESSION_META_TTL = 3600
 
 async def get_classifier_history(session_id: str) -> list[dict]:
     raw = await redis.get(f"session:{session_id}:classifier_history")
-    return json.loads(raw) if raw else []
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse classifier_history for session {session_id}: {e}. Raw content: {raw[:200]}")
+        return []
 
 
 async def get_causal_history(session_id: str) -> list[HistoryTurn]:
     raw = await redis.get(f"session:{session_id}:causal_history")
     if not raw:
         return []
-    return [HistoryTurn(**h) for h in json.loads(raw)]
+    try:
+        return [HistoryTurn(**h) for h in json.loads(raw)]
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"Failed to parse causal_history for session {session_id}: {e}. Raw content: {raw[:200]}")
+        return []
 
 
 async def get_cached_trajectory(session_id: str) -> SessionTrajectory | None:
     raw = await redis.get(f"session:{session_id}:trajectory")
-    return SessionTrajectory(**json.loads(raw)) if raw else None
+    if not raw:
+        return None
+    try:
+        return SessionTrajectory(**json.loads(raw))
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"Failed to parse trajectory for session {session_id}: {e}. Raw content: {raw[:200]}")
+        return None
 
 
-async def get_trace_history(session_id: str) -> list[TraceTurn]:
+async def get_trace_history(session_id: str) -> list[dict]:
     raw = await redis.get(f"session:{session_id}:trace_history")
     if not raw:
         return []
-    return [TraceTurn(**t) for t in json.loads(raw)]
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse trace_history for session {session_id}: {e}. Raw content: {raw[:200]}")
+        return []
 
 
-async def get_session_tone(session_id: str) -> TonePreference:
+async def get_session_tone(session_id: str) -> str:
     raw = await redis.get(f"session:{session_id}:tone")
-    return TonePreference(raw) if raw else TonePreference.FRIENDLY
+    return raw if raw else "friendly"
+
+
+async def get_cached_session_framework(session_id: str) -> dict | None:
+    raw = await redis.get(f"session:{session_id}:session_framework")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse session_framework for session {session_id}: {e}")
+        return None
 
 
 async def get_trajectory(session_id: str, user_id: str | None, db: AsyncSession) -> SessionTrajectory:
-    """
-    Load trajectory from Redis. On first turn of a session, seed cross-session
-    baseline from Postgres if the user has a prior profile.
-    """
+    """Load trajectory from Redis. On first turn, seed cross-session baseline from Postgres."""
     cached = await get_cached_trajectory(session_id)
     if cached:
         return cached
 
-    # New session — build fresh trajectory, seed from user profile if available
     traj = SessionTrajectory(session_id=session_id)
-
     if user_id:
         result = await db.execute(
             select(UserEmotionalProfile).where(UserEmotionalProfile.user_id == user_id)
@@ -115,7 +148,6 @@ async def get_trajectory(session_id: str, user_id: str | None, db: AsyncSession)
                 "cross_session_baseline": profile.mean_valence,
                 "sessions_seen": profile.sessions_seen,
             })
-
     return traj
 
 
@@ -124,7 +156,7 @@ async def save_all_histories(
     classifier_history: list[dict],
     causal_history: list[HistoryTurn],
     trajectory: SessionTrajectory,
-    trace_history: list[TraceTurn],
+    trace_history: list[dict],
     session_framework: SessionFramework,
 ):
     await asyncio.gather(
@@ -146,7 +178,7 @@ async def save_all_histories(
         redis.setex(
             f"session:{session_id}:trace_history",
             SESSION_META_TTL,
-            json.dumps([t.model_dump() for t in trace_history[-6:]])
+            json.dumps(trace_history[-6:])
         ),
         redis.setex(
             f"session:{session_id}:session_framework",
@@ -163,10 +195,7 @@ async def close_session_trajectory(
     causal_history: list[HistoryTurn],
     db: AsyncSession,
 ):
-    """
-    Persist cross-session profile to Postgres when a session ends.
-    Only for authenticated users. Uses a rolling mean for valence baseline.
-    """
+    """Persist cross-session profile to Postgres when a session ends."""
     if not user_id or not trajectory.valence_series:
         return
 
@@ -174,7 +203,6 @@ async def close_session_trajectory(
         sum(trajectory.valence_series) / len(trajectory.valence_series)
     )
 
-    # Collect cause_types from this session
     cause_types = [h.cause_type for h in causal_history if h.cause_type]
     cause_type_counts: dict[str, int] = {}
     for ct in cause_types:
@@ -200,11 +228,8 @@ async def close_session_trajectory(
         )
         db.add(profile)
     else:
-        # Rolling mean: weight prior sessions equally
         n = profile.sessions_seen
         new_mean = (profile.mean_valence * n + session_mean_valence) / (n + 1)
-
-        # Merge cause type rankings
         prior_counts = {ct: (3 - i) for i, ct in enumerate(profile.dominant_cause_types)}
         for i, ct in enumerate(ranked_causes):
             prior_counts[ct] = prior_counts.get(ct, 0) + (len(ranked_causes) - i)
@@ -239,7 +264,6 @@ async def create_session(
     await db.commit()
     await db.refresh(db_session)
 
-    # Cache tone in Redis for fast access during pipeline calls
     await redis.setex(
         f"session:{db_session.id}:tone",
         SESSION_META_TTL,
@@ -287,12 +311,13 @@ async def classify_emotion(
 
     # ── Load histories ────────────────────────────────────────────────────────
     history_started = perf_counter()
-    classifier_history, causal_history, cached_trajectory, trace_history, tone_preference = await asyncio.gather(
+    classifier_history, causal_history, cached_trajectory, trace_history, tone, sf_raw = await asyncio.gather(
         get_classifier_history(session_id_str),
         get_causal_history(session_id_str),
         get_cached_trajectory(session_id_str),
         get_trace_history(session_id_str),
         get_session_tone(session_id_str),
+        get_cached_session_framework(session_id_str),
     )
     trajectory = (
         cached_trajectory
@@ -300,19 +325,37 @@ async def classify_emotion(
         else await get_trajectory(session_id_str, user_id, db)
     )
 
-    # Session framework is persisted per-session (Redis). For now, default to
-    # pre-framework mode when not found.
-    session_framework = SessionFramework()
+    # Reconstruct or default session framework
+    if sf_raw:
+        session_framework = SessionFramework(**sf_raw)
+    else:
+        session_framework = SessionFramework()
+
+    # Determine prior intent: last entry in trace_history or default to processing
+    prior_intent_str = "processing"
+    if trace_history and len(trace_history) > 0:
+        last_trace = trace_history[-1]
+        prior_intent_str = last_trace.get("intent_state", "processing")
+
     logger.info(
         "API timing | session_id=%s stage=load_histories duration_ms=%.1f",
         session_id_str,
         (perf_counter() - history_started) * 1000,
     )
 
-    # ── Run pipeline ──────────────────────────────────────────────────────────
-    pipeline_started = perf_counter()
+    # ── Build session context dict ─────────────────────────────────────────────
+    session_context = {
+        "classifier_history":      classifier_history,
+        "causal_history":          [h.model_dump(mode="json") for h in causal_history],
+        "trajectory":              trajectory,
+        "trace_history":           trace_history,  # list of TraceTurn dicts
+        "session_framework":       session_framework.model_dump(),
+        "tone":                    tone,
+        "prior_intent":            prior_intent_str,
+        "session_history_summary": _build_session_summary(classifier_history),
+    }
 
-    # Build cross-session summary string if user has a prior profile
+    # ── Build cross-session summary ─────────────────────────────────────────────
     cross_session_summary: str | None = None
     if user_id:
         profile_result = await db.execute(
@@ -328,18 +371,15 @@ async def classify_emotion(
                 f"Their last session ended with a trajectory flag of '{profile.last_session_flag}' "
                 f"and dominant emotion of '{profile.last_session_end_emotion}'."
             )
+    if cross_session_summary:
+        session_context["session_history_summary"] = cross_session_summary
 
-    envelope, updated_trajectory, updated_session_framework = await run_pipeline(
+    # ── Run pipeline ──────────────────────────────────────────────────────────
+    pipeline_started = perf_counter()
+    envelope, updated_trajectory, updated_session_framework, intent_state = await run_pipeline(
         text=req.text,
         session_id=session_id_str,
-        user_id=user_id,
-        classifier_history=classifier_history,
-        causal_history=causal_history,
-        trajectory=trajectory,
-        session_framework=session_framework,
-        tone_preference=tone_preference,
-        trace_history=trace_history,
-        cross_session_summary=cross_session_summary,
+        session_context=session_context,
     )
     logger.info(
         "API timing | session_id=%s stage=pipeline duration_ms=%.1f",
@@ -352,7 +392,7 @@ async def classify_emotion(
     turn = Turn(
         session_id=db_session.id,
         text=req.text,
-        translation=envelope.classifier_output.translation,
+        translation=getattr(envelope.classifier_output, "translation", None),
         top_3=[e.model_dump(mode="json") for e in envelope.classifier_output.top_3],
         reasoning=envelope.classifier_output.reasoning,
         causal_analysis=envelope.causal_output.model_dump(mode="json"),
@@ -375,24 +415,41 @@ async def classify_emotion(
     )
 
     # ── Update histories ──────────────────────────────────────────────────────
-    new_history_turn = build_history_turn(req.text, envelope)
+    # Build history turn from envelope
+    top_emotion = (
+        envelope.classifier_output.top_3[0].emotion.value
+        if envelope.classifier_output.top_3 else "neutral"
+    )
+    top_confidence = (
+        envelope.classifier_output.top_3[0].confidence
+        if envelope.classifier_output.top_3 else 0.0
+    )
 
     classifier_history.append({
         "text": req.text,
-        "translation": envelope.classifier_output.translation,
+        "translation": getattr(envelope.classifier_output, "translation", None),
         "top_3": [e.model_dump(mode="json") for e in envelope.classifier_output.top_3],
         "reasoning": envelope.classifier_output.reasoning,
+        "situation_type": envelope.situation_type,
     })
-    causal_history.append(new_history_turn)
 
-    # Append to trace history only if TRACE ran (not escalated)
+    causal_history.append(HistoryTurn(
+        turn_index=len(causal_history) + 1,
+        text=req.text,
+        top_emotion=top_emotion,
+        cause_type=envelope.causal_output.cause_type.value,
+        valence=0.0,  # will be properly computed from trajectory
+    ))
+
+    # Append to trace history if TRACE ran
     if envelope.trace_output and not envelope.trace_output.error:
-        trace_history.append(TraceTurn(
-            student_text=req.text,
-            trace_response=envelope.trace_output.response_text,
-            strategy_used=envelope.trace_output.strategy_used,
-            turn_number=updated_trajectory.turn_count + 1,
-        ))
+        trace_history.append({
+            "student_message": req.text,
+            "trace_response": envelope.trace_output.response_text,
+            "strategy_used": envelope.trace_output.strategy_used,
+            "turn_index": len(trace_history) + 1,
+            "intent_state": intent_state.value,
+        })
 
     redis_started = perf_counter()
     await save_all_histories(
@@ -480,17 +537,25 @@ async def delete_session(session_id: str, db: AsyncSession = Depends(get_db)):
     if not db_session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Persist trajectory to user profile before deleting
     user_id = db_session.user_id
     trajectory_raw = await redis.get(f"session:{session_id}:trajectory")
     if trajectory_raw and user_id:
-        trajectory = SessionTrajectory(**json.loads(trajectory_raw))
+        try:
+            trajectory = SessionTrajectory(**json.loads(trajectory_raw))
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse trajectory in delete_session: {e}")
+            trajectory = None
+
         causal_raw = await redis.get(f"session:{session_id}:causal_history")
-        causal_history = (
-            [HistoryTurn(**h) for h in json.loads(causal_raw)]
-            if causal_raw else []
-        )
-        await close_session_trajectory(session_id, user_id, trajectory, causal_history, db)
+        causal_history = []
+        if causal_raw:
+            try:
+                causal_history = [HistoryTurn(**h) for h in json.loads(causal_raw)]
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.error(f"Failed to parse causal_history in delete_session: {e}")
+
+        if trajectory:
+            await close_session_trajectory(session_id, user_id, trajectory, causal_history, db)
 
     await db.delete(db_session)
     await db.commit()
@@ -505,9 +570,6 @@ async def delete_session(session_id: str, db: AsyncSession = Depends(get_db)):
 
 
 # ─── /session/{id}/close POST ─────────────────────────────────────────────────
-# Explicit session-close endpoint. Call this when the user ends the conversation
-# gracefully (e.g. they click "end session"). Persists cross-session profile
-# without deleting the session record or turn history.
 
 @app.post("/session/{session_id}/close")
 async def close_session(session_id: str, db: AsyncSession = Depends(get_db)):
@@ -523,16 +585,22 @@ async def close_session(session_id: str, db: AsyncSession = Depends(get_db)):
     if not trajectory_raw:
         return {"status": "no trajectory to persist"}
 
-    trajectory = SessionTrajectory(**json.loads(trajectory_raw))
+    try:
+        trajectory = SessionTrajectory(**json.loads(trajectory_raw))
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"Failed to parse trajectory in persist_trajectory: {e}")
+        return {"status": "error", "error": "Failed to parse trajectory"}
+
     causal_raw = await redis.get(f"session:{session_id}:causal_history")
-    causal_history = (
-        [HistoryTurn(**h) for h in json.loads(causal_raw)]
-        if causal_raw else []
-    )
+    causal_history = []
+    if causal_raw:
+        try:
+            causal_history = [HistoryTurn(**h) for h in json.loads(causal_raw)]
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse causal_history in persist_trajectory: {e}")
 
     await close_session_trajectory(session_id, user_id, trajectory, causal_history, db)
 
-    # Clear Redis caches — session is closed
     await redis.delete(f"session:{session_id}:classifier_history")
     await redis.delete(f"session:{session_id}:causal_history")
     await redis.delete(f"session:{session_id}:trajectory")
@@ -567,3 +635,19 @@ async def get_user_profile(user_id: str, db: AsyncSession = Depends(get_db)):
         "last_session_end_emotion": profile.last_session_end_emotion,
         "updated_at":               profile.updated_at,
     }
+
+
+# ─── Helper ───────────────────────────────────────────────────────────────────
+
+def _build_session_summary(classifier_history: list[dict]) -> str:
+    """Compress classifier history into a one-line summary for the planner."""
+    if not classifier_history:
+        return ""
+    parts = []
+    for h in classifier_history[-4:]:
+        emotion = "unknown"
+        if h.get("top_3"):
+            emotion = h["top_3"][0].get("emotion", "unknown") if isinstance(h["top_3"], list) else "unknown"
+        sit = h.get("situation_type", "unknown")
+        parts.append(f"[{emotion}/{sit}]")
+    return " ".join(parts)

@@ -72,16 +72,17 @@ class TraceResult(BaseModel):
 
 
 class TurnResponse(BaseModel):
-    turn_id: UUID
+    turn_id: Optional[UUID] = None
     session_id: UUID
-    text: str
+    text: Optional[str] = None
     translation: Optional[str]
     top_3: list[EmotionScore]
     reasoning: str
     causal_analysis: Optional[CausalAnalysis] = None
     planner_output: Optional[PlannerResult] = None
     trace_output: Optional[TraceResult] = None
-    created_at: datetime
+    created_at: Optional[datetime] = None
+    response_text: Optional[str] = None
 
 
 class CausalRequest(BaseModel):

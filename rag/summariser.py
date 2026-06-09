@@ -6,14 +6,13 @@ Strict grounding — returns None if chunks aren't relevant.
 """
 
 import os
-from groq import AsyncGroq
+from llm import get_llm_client
 from dotenv import load_dotenv
 
 from contracts.rag_contract import RAGChunk
 
 load_dotenv()
-client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL  = "llama-3.3-70b-versatile"
+_client, MODEL = get_llm_client()
 
 SYSTEM_PROMPT = """You are a document summariser for a student mental health support system.
 
@@ -53,7 +52,7 @@ async def summarise(chunks: list[RAGChunk], student_context: str) -> str | None:
     )
 
     try:
-        response = await client.chat.completions.create(
+        result = await _client.chat_completion(
             model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -62,7 +61,6 @@ async def summarise(chunks: list[RAGChunk], student_context: str) -> str | None:
             temperature=0.05,
             max_tokens=200,
         )
-        result = response.choices[0].message.content.strip()
         return None if (result == "NO_RELEVANT_CONTENT" or not result) else result
     except Exception:
         return None

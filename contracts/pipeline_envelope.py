@@ -1,31 +1,44 @@
+from typing import Optional, Any
 from pydantic import BaseModel
-from typing import Optional
-from uuid import UUID
-from datetime import datetime
-
-from contracts.classifier_contract import ClassifierOutput
-from contracts.causal_contract import CausalOutput
-from contracts.planner_contract import PlannerOutput
-from contracts.trace_contract import TraceOutput, TonePreference, DetectedLanguage
-from contracts.trajectory_contract import TrajectoryFlag
 
 
 class PipelineEnvelope(BaseModel):
-    turn_id: Optional[UUID]       = None
-    session_id: Optional[str]     = None
-    user_id: Optional[str]        = None
-    timestamp: datetime           = datetime.utcnow()
-    raw_text: str
+    """
+    Complete output of one pipeline turn.
+    All agent outputs stacked — used for persistence and API response assembly.
+    """
 
-    # ── Session-level context (set once at session create) ────────────────────
-    tone_preference:   TonePreference   = TonePreference.FRIENDLY
-    detected_language: DetectedLanguage = DetectedLanguage.ENGLISH
+    # Raw input
+    text:               str
+    detected_language:  str
+    tone_preference:    str
 
-    # ── Agent outputs ─────────────────────────────────────────────────────────
-    classifier_output: Optional[ClassifierOutput] = None
-    causal_output:     Optional[CausalOutput]     = None
-    planner_output:    Optional[PlannerOutput]    = None
-    trace_output:      Optional[TraceOutput]      = None
+    # Stage 1 — Fused classifier + situation
+    classifier_output:  Any   # Stage1Output
+    situation_type:     str   # NEW
+    situation_summary:  str   # NEW
 
-    # ── Orchestrator signals ─────────────────────────────────────────────────
-    escalation_flag: Optional[TrajectoryFlag] = None
+    # Stage 3 — Fused causal + cognitive pattern + behavioral risk
+    causal_output:      Any   # CausalOutput
+    cognitive_pattern:  str   # NEW
+    behavioral_risk:    str   # NEW
+
+    # Stage 4 — Intent (NEW)
+    intent_state:       str   # processing | action_seeking | transitioning | crisis
+
+    # Stage 6 — Planner
+    planner_output:     Any   # PlannerOutput (contains TechniqueCluster)
+
+    # Stage 8 — TRACE
+    trace_output:       Optional[Any]  # TraceOutput | None if escalated
+
+    # Convenience accessors
+    @property
+    def response_text(self) -> Optional[str]:
+        if self.trace_output:
+            return self.trace_output.response_text
+        return None
+
+    @property
+    def escalated(self) -> bool:
+        return self.planner_output.escalate_to_safety if self.planner_output else False

@@ -21,11 +21,11 @@ from contracts.planner_contract import TherapeuticFramework
 # Hard constraints — planner output is overridden if it violates these.
 
 COMPATIBLE_STRATEGIES: dict[str, list[str]] = {
-    "cbt":              ["reframe", "psychoeducate", "probe", "validate"],
-    "mi":               ["motivate", "probe", "reflect", "validate"],
-    "solution_focused": ["solution_elicit", "validate", "probe", "psychoeducate"],
-    "person_centred":   ["validate", "reflect", "active_listen", "psychoeducate"],
-    "none":             ["active_listen", "validate"],
+    "cbt":              ["reframe", "psychoeducate", "probe", "validate", "ground"],
+    "mi":               ["motivate", "probe", "reflect", "validate", "ground"],
+    "solution_focused": ["solution_elicit", "validate", "probe", "psychoeducate", "ground"],
+    "person_centred":   ["validate", "reflect", "active_listen", "psychoeducate", "ground"],
+    "none":             ["active_listen", "validate", "ground"],
 }
 
 # Fallback strategy if planner selects incompatible one

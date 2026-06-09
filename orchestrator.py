@@ -1,327 +1,252 @@
-import logging
-from time import perf_counter
+import asyncio
+from typing import Optional
 
-from contracts.classifier_contract import ClassifierInput, ClassifierOutput
-from contracts.causal_contract import CausalInput, CausalOutput, HistoryTurn
-from contracts.planner_contract import PlannerInput, PlannerOutput
-from contracts.trace_contract import TraceInput, TraceOutput, TraceTurn, TonePreference, DetectedLanguage
+from contracts.situation_contract import SituationType
+from contracts.intent_contract import IntentState, detect_intent
+from contracts.causal_contract import CausalInput, HistoryTurn
+from contracts.planner_contract import PlannerInput
+from contracts.trace_contract import TraceInput, TonePreference, DetectedLanguage
+from contracts.session_framework_contract import SessionFramework
 from contracts.pipeline_envelope import PipelineEnvelope
-from contracts.trajectory_contract import SessionTrajectory, TrajectoryFlag
-from contracts.session_framework_contract import SessionFramework, update_session_framework
+from classifier import classify, Stage1Output
+from causal_engine import analyse
+from planner_engine import plan
+from trace_engine import generate
 
-from classifier import classify as _classify_raw
-from causal_engine import analyse as _analyse_raw
-from planner_engine import plan_async as _plan_raw
-from trace_engine import generate_async as _trace_raw
-from trajectory_engine import update_trajectory, format_trajectory_for_llm, _weighted_valence
+# ---------------------------------------------------------------------------
+# Language detection — heuristic, keyword-based
+# Upgrade to langdetect or lingua in a future session
+# ---------------------------------------------------------------------------
 
-
-logger = logging.getLogger(__name__)
-
-
-# ─── Mappers ──────────────────────────────────────────────────────────────────
-
-def _map_to_classifier_input(
-    text: str,
-    session_id: str | None,
-    user_id: str | None
-) -> ClassifierInput:
-    return ClassifierInput(
-        text=text,
-        session_id=session_id,
-        user_id=user_id
-    )
-
-
-def _map_classifier_to_causal(
-    classifier_output: ClassifierOutput,
-    session_history: list[HistoryTurn],
-    trajectory: SessionTrajectory,
-) -> CausalInput:
-    return CausalInput(
-        text=classifier_output.text,
-        top_emotions=[e.model_dump(mode="json") for e in classifier_output.top_3],
-        reasoning=classifier_output.reasoning,
-        session_history=session_history,
-        trajectory_context=format_trajectory_for_llm(trajectory),
-    )
-
-
-def _map_to_planner_input(
-    classifier_output: ClassifierOutput,
-    causal_output: CausalOutput,
-    trajectory: SessionTrajectory,
-    session_framework: SessionFramework,
-) -> PlannerInput:
-    top = classifier_output.top_3[0] if classifier_output.top_3 else None
-
-    # current_valence: weighted across all 3 scores — same as trajectory engine
-    current_valence = _weighted_valence(classifier_output.top_3)
-
-    return PlannerInput(
-        # ── Classifier ────────────────────────────────────────────────────────
-        text=classifier_output.text,
-        top_emotion=top.emotion.value if top else "neutral",
-        emotion_confidence=top.confidence if top else 0.0,
-        top_3_emotions=[e.model_dump(mode="json") for e in classifier_output.top_3],
-
-        # ── Causal ───────────────────────────────────────────────────────────
-        global_cause=causal_output.global_cause,
-        causal_chain=causal_output.causal_chain,
-        cause_type=causal_output.cause_type.value,
-        causal_confidence_score=causal_output.confidence_score,
-        causal_confidence_category=causal_output.confidence_category.value,
-        causal_planner_instruction=causal_output.planner_instruction.value,
-        clarifying_question=causal_output.clarifying_question,
-
-        # ── Trajectory ───────────────────────────────────────────────────────
-        trajectory_flag=trajectory.current_flag.value,
-        valence_direction=trajectory.valence_direction.value,
-        current_arousal=trajectory.current_arousal.value,
-        current_valence=current_valence,
-        shift_events=[s.model_dump() for s in trajectory.shift_events[-3:]],
-        turn_count=trajectory.turn_count,
-        cross_session_baseline=trajectory.cross_session_baseline,
-
-        # ── Session framework ───────────────────────────────────────────────
-        session_framework=session_framework.framework.value,
-        session_framework_is_set=session_framework.is_set,
-        session_framework_locked=(
-            trajectory.turn_count < session_framework.locked_until_turn
-        ),
-        session_framework_change_count=session_framework.change_count,
-    )
-
-
-def _map_turn_to_history(
-    text: str,
-    classifier_output: ClassifierOutput,
-    causal_output: CausalOutput
-) -> HistoryTurn:
-    top = classifier_output.top_3[0] if classifier_output.top_3 else None
-    return HistoryTurn(
-        text=text,
-        top_emotion=top.emotion.value if top else "neutral",
-        confidence=top.confidence if top else 0.0,
-        cause_type=causal_output.cause_type.value,
-        temporal_pattern=causal_output.temporal_pattern
-    )
-
-
-# ─── Agent wrappers ───────────────────────────────────────────────────────────
-
-def _run_classifier(input: ClassifierInput, history: list[dict]) -> ClassifierOutput:
-    return _classify_raw(input.text, history)
-
-
-def _run_causal(input: CausalInput) -> CausalOutput:
-    return _analyse_raw(input)
-
-
-async def _run_planner(input: PlannerInput) -> PlannerOutput:
-    return await _plan_raw(input)
-
+SWAHILI_KEYWORDS = {
+    "mimi", "wewe", "yeye", "sisi", "ninajua", "sijui", "niko", "uko",
+    "hapa", "pale", "sana", "kidogo", "lakini", "kwa", "na", "ya",
+    "ni", "au", "bado", "tayari", "tena", "karibu", "mbali", "sawa",
+    "pole", "asante", "habari", "nzuri", "vibaya", "shida", "msaada",
+    "nisaidie", "nifanye", "nataka", "sifahamu", "naomba",
+}
 
 def _detect_language(text: str) -> DetectedLanguage:
-    """
-    Lightweight Swahili detection via common function words and markers.
-    Classifier already handles both languages for emotion — this is for
-    TRACE response language only. Swahili is opted-in: defaults to English
-    when ambiguous. A proper langdetect library can replace this later.
-    """
-    SWAHILI_MARKERS = {
-        "ni", "na", "ya", "wa", "kwa", "pia", "lakini", "sana", "kabisa",
-        "sijui", "ninajua", "sijisikii", "naomba", "asante", "tafadhali",
-        "ninahisi", "ninafikiria", "leo", "jana", "kesho", "rafiki",
-        "mimi", "wewe", "yeye", "sisi", "nyinyi", "wao", "hii", "hiyo",
-        "ndiyo", "hapana", "bado", "tayari", "kweli", "pole", "samahani",
-    }
-    tokens = set(text.lower().split())
-    matches = tokens & SWAHILI_MARKERS
-    # Require at least 2 marker matches to reduce false positives
-    return DetectedLanguage.SWAHILI if len(matches) >= 2 else DetectedLanguage.ENGLISH
+    words = set(text.lower().split())
+    matches = words & SWAHILI_KEYWORDS
+    if len(matches) >= 2:
+        # Check for code-switching (mix of Swahili and English)
+        english_words = {"i", "the", "is", "are", "was", "have", "my", "me", "you", "it"}
+        if words & english_words:
+            return DetectedLanguage.mixed
+        return DetectedLanguage.sw
+    return DetectedLanguage.en
 
+
+# ---------------------------------------------------------------------------
+# Mapper: Stage1Output + CausalOutput + intent → TraceInput
+# ---------------------------------------------------------------------------
 
 def _map_to_trace_input(
-    planner_output: PlannerOutput,
-    raw_text: str,
-    tone_preference: TonePreference,
+    text: str,
     detected_language: DetectedLanguage,
-    trace_history: list[TraceTurn],
-    cross_session_summary: str | None,
+    tone_preference: TonePreference,
+    planner_output,
+    causal_output,
+    intent_state: IntentState,
+    trace_history: list,
 ) -> TraceInput:
     return TraceInput(
-        response_directive=planner_output.response_directive,
-        framework=planner_output.framework.value,
-        strategy=planner_output.strategy.value,
-        clarifying_question=planner_output.clarifying_question,
-        kb_context=planner_output.kb_context,
-        escalate_to_safety=planner_output.escalate_to_safety,
-        student_text=raw_text,
-        tone_preference=tone_preference,
+        text=text,
         detected_language=detected_language,
+        tone_preference=tone_preference,
+        technique_cluster=planner_output.technique_cluster,
+        executor_instruction=planner_output.technique_cluster.executor_instruction,
+        global_cause=causal_output.global_cause,
+        trigger_spans=[span.span for span in causal_output.trigger_spans],
+        clarifying_question_from_cae=causal_output.clarifying_question,
+        intent_state=intent_state.value,
         trace_history=trace_history,
-        cross_session_summary=cross_session_summary,
     )
 
 
-# ─── Pipeline ─────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
 async def run_pipeline(
     text: str,
-    session_id: str | None,
-    user_id: str | None,
-    classifier_history: list[dict],
-    causal_history: list[HistoryTurn],
-    trajectory: SessionTrajectory,
-    session_framework: SessionFramework,
-    tone_preference: TonePreference = TonePreference.FRIENDLY,
-    trace_history: list[TraceTurn] = [],
-    cross_session_summary: str | None = None,
-) -> tuple[PipelineEnvelope, SessionTrajectory, SessionFramework]:
-    """
-    Stage 1 — Classifier
-    Stage 2 — Causal Analysis  (receives trajectory context)
-    Stage 3 — Strategic Planner (receives classifier + causal + trajectory + session framework)
-    Stage 4 — TRACE (skipped if escalate_to_safety=True)
+    session_id: str,
+    session_context: dict,
+    # session_context keys:
+    #   classifier_history: list[dict]   — last 6 Stage1Output dicts
+    #   causal_history: list[dict]       — last 6 HistoryTurn dicts
+    #   trajectory: dict                 — SessionTrajectory dict
+    #   trace_history: list              — last 6 TraceTurn objects
+    #   session_framework: dict          — SessionFramework dict
+    #   tone: str                        — "friendly" | "clinical"
+    #   prior_intent: str                — last turn's intent state
+    #   session_history_summary: str     — compressed prior turns
+):
+    from trajectory_engine import update_trajectory
+    from contracts.session_framework_contract import update_session_framework
+    from contracts.classifier_contract import ClassifierInput
 
-    Returns (envelope, updated_trajectory, updated_session_framework).
-    """
-    # Detect language on raw text before any processing
+    # ── Pre-pipeline ────────────────────────────────────────────────────────
     detected_language = _detect_language(text)
+    tone_preference   = TonePreference(session_context.get("tone", "friendly"))
 
-    envelope = PipelineEnvelope(
-        session_id=session_id,
-        user_id=user_id,
-        raw_text=text,
-        tone_preference=tone_preference,
-        detected_language=detected_language,
+    # ── Stage 1 — Fused: emotion classification + situation type (1 LLM call) ─
+    stage1_output: Stage1Output = await classify(
+        ClassifierInput(text=text, session_id=session_id),
+        session_context.get("classifier_history", []),
     )
-    pipeline_started = perf_counter()
 
-    # Stage 1: Classifier
-    classifier_input  = _map_to_classifier_input(text, session_id, user_id)
-    classifier_started = perf_counter()
-    classifier_output = _run_classifier(classifier_input, classifier_history)
-    logger.info(
-        "Pipeline timing | session_id=%s stage=classifier duration_ms=%.1f",
-        session_id,
-        (perf_counter() - classifier_started) * 1000,
-    )
-    envelope.classifier_output = classifier_output
+    # ── Stage 2 — Trajectory update (deterministic) ─────────────────────────
+    from contracts.trajectory_contract import SessionTrajectory
 
-    # Stage 2: Causal Analysis
-    causal_input  = _map_classifier_to_causal(classifier_output, causal_history, trajectory)
-    causal_started = perf_counter()
-    causal_output = _run_causal(causal_input)
-    logger.info(
-        "Pipeline timing | session_id=%s stage=causal duration_ms=%.1f",
-        session_id,
-        (perf_counter() - causal_started) * 1000,
-    )
-    envelope.causal_output = causal_output
-
-    # Stage 3: Strategic Planner (async — may trigger RAG)
-    planner_input  = _map_to_planner_input(
-        classifier_output, causal_output, trajectory, session_framework
-    )
-    planner_started = perf_counter()
-    planner_output = await _run_planner(planner_input)
-    logger.info(
-        "Pipeline timing | session_id=%s stage=planner duration_ms=%.1f",
-        session_id,
-        (perf_counter() - planner_started) * 1000,
-    )
-    envelope.planner_output = planner_output
-
-    # Stage 4: TRACE — skipped entirely if escalate_to_safety is True
-    if not planner_output.escalate_to_safety:
-        trace_input = _map_to_trace_input(
-            planner_output=planner_output,
-            raw_text=text,
-            tone_preference=tone_preference,
-            detected_language=detected_language,
-            trace_history=trace_history,
-            cross_session_summary=cross_session_summary,
-        )
-        trace_started = perf_counter()
-        trace_output = await _trace_raw(trace_input)
-        logger.info(
-            "Pipeline timing | session_id=%s stage=trace duration_ms=%.1f",
-            session_id,
-            (perf_counter() - trace_started) * 1000,
-        )
-        envelope.trace_output = trace_output
+    # Rehydrate trajectory if it came in as a dict
+    traj_data = session_context.get("trajectory")
+    if isinstance(traj_data, dict):
+        trajectory = SessionTrajectory(**traj_data)
     else:
-        logger.info(
-            "Pipeline timing | session_id=%s stage=trace status=skipped reason=escalate_to_safety",
-            session_id,
-        )
+        trajectory = traj_data if traj_data is not None else SessionTrajectory(session_id=session_id)
 
-    logger.info(
-        "Pipeline timing | session_id=%s stage=total duration_ms=%.1f",
-        session_id,
-        (perf_counter() - pipeline_started) * 1000,
+    trajectory = update_trajectory(
+        trajectory,
+        stage1_output.top_3,
     )
 
-    # Update session framework + trajectory based on this completed envelope
-    updated_trajectory = advance_trajectory(trajectory, envelope)
-    envelope.escalation_flag = get_escalation_flag(updated_trajectory)
-    updated_sf = update_session_framework(
-        sf=session_framework,
-        turn_count=updated_trajectory.turn_count,
-        trajectory_flag=updated_trajectory.current_flag.value,
+    # ── Stage 3 — Fused: causal analysis + cognitive pattern + behavioral risk ─
+    causal_history = [
+        HistoryTurn(**h) for h in session_context.get("causal_history", [])
+    ]
+    causal_output = await analyse(
+        CausalInput(
+            text=text,
+            top_emotions=[e.model_dump() for e in stage1_output.top_3],
+            reasoning=stage1_output.reasoning,
+            situation_type=stage1_output.situation_type.value,
+            session_history=causal_history,
+        )
+    )
+
+    # ── Stage 4 — Intent detection (deterministic) ───────────────────────────
+    prior_intent_str  = session_context.get("prior_intent", IntentState.processing.value)
+    prior_intent      = IntentState(prior_intent_str)
+    intent_state      = detect_intent(
+        text=text,
+        trajectory_flag=trajectory.current_flag,
+        prior_intent=prior_intent,
+        turn_count=trajectory.turn_count,
+    )
+
+    # ── Stage 5 — Session framework update (deterministic) ───────────────────
+    # Rehydrate session framework if it came in as a dict
+    sf_data = session_context.get("session_framework")
+    if isinstance(sf_data, dict):
+        prior_sf = SessionFramework(**sf_data)
+    elif isinstance(sf_data, SessionFramework):
+        prior_sf = sf_data
+    else:
+        prior_sf = SessionFramework()
+
+    session_framework: SessionFramework = update_session_framework(
+        sf=prior_sf,
+        turn_count=trajectory.turn_count,
+        trajectory_flag=trajectory.current_flag.value,
         cause_type=causal_output.cause_type.value,
         causal_confidence_category=causal_output.confidence_category.value,
     )
-    if (
-        updated_sf.framework != session_framework.framework
-        or updated_sf.is_set != session_framework.is_set
-    ):
-        logger.info(
-            "Session framework | session_id=%s %s → %s (change_count=%d)",
-            session_id,
-            session_framework.framework.value,
-            updated_sf.framework.value,
-            updated_sf.change_count,
+
+    # ── Stage 6 — Micro-intervention planner (1 LLM call) ────────────────────
+    planner_output = await plan(
+        PlannerInput(
+            text=text,
+            situation_type=stage1_output.situation_type.value,
+            situation_summary=stage1_output.situation_summary,
+            has_concrete_deadline=stage1_output.has_concrete_deadline,
+            has_external_referents=stage1_output.has_external_referents,
+            cognitive_pattern=causal_output.cognitive_pattern.value,
+            behavioral_risk=causal_output.behavioral_risk.value,
+            intent_state=intent_state.value,
+            top_emotion=stage1_output.top_3[0].emotion,
+            emotion_confidence=stage1_output.top_3[0].confidence,
+            cause_type=causal_output.cause_type.value,
+            confidence_category=causal_output.confidence_category.value,
+            causal_chain=causal_output.causal_chain,
+            temporal_pattern=causal_output.temporal_pattern,
+            planner_instruction=causal_output.planner_instruction.value,
+            clarifying_question=causal_output.clarifying_question,
+            session_framework=session_framework.framework,
+            session_history_summary=session_context.get("session_history_summary", ""),
+        ),
+        arousal=trajectory.current_arousal,
+        valence=trajectory.valence_series[-1] if trajectory.valence_series else -0.3,
+    )
+
+    # ── Stage 7 — RAG (conditional) ──────────────────────────────────────────
+    if _should_retrieve(planner_output, stage1_output):
+        try:
+            from rag.rag_pipeline import retrieve
+            rag_result = await retrieve(text, planner_output)
+            planner_output = _inject_rag_context(planner_output, rag_result)
+        except Exception as e:
+            print(f"[RAG] Retrieval failed: {e}")
+
+    # ── Stage 8 — TRACE (1 LLM call, skipped if escalate_to_safety) ──────────
+    trace_output = None
+    if not planner_output.escalate_to_safety:
+        trace_input = _map_to_trace_input(
+            text=text,
+            detected_language=detected_language,
+            tone_preference=tone_preference,
+            planner_output=planner_output,
+            causal_output=causal_output,
+            intent_state=intent_state,
+            trace_history=session_context.get("trace_history", []),
         )
+        trace_output = await generate(trace_input)
 
-    return envelope, updated_trajectory, updated_sf
-
-
-def build_history_turn(
-    text: str,
-    envelope: PipelineEnvelope
-) -> HistoryTurn:
-    return _map_turn_to_history(
-        text,
-        envelope.classifier_output,
-        envelope.causal_output
+    # ── Assemble envelope ────────────────────────────────────────────────────
+    envelope = PipelineEnvelope(
+        text=text,
+        detected_language=detected_language.value,
+        tone_preference=tone_preference.value,
+        classifier_output=stage1_output,
+        situation_type=stage1_output.situation_type.value,
+        situation_summary=stage1_output.situation_summary,
+        causal_output=causal_output,
+        cognitive_pattern=causal_output.cognitive_pattern.value,
+        behavioral_risk=causal_output.behavioral_risk.value,
+        intent_state=intent_state.value,
+        planner_output=planner_output,
+        trace_output=trace_output,
     )
 
-
-def advance_trajectory(
-    trajectory: SessionTrajectory,
-    envelope: PipelineEnvelope,
-) -> SessionTrajectory:
-    """
-    Update trajectory from completed pipeline envelope.
-    Uses the full top_3 emotion scores — matching the actual trajectory_engine
-    signature which takes list[EmotionScore] for weighted valence/arousal.
-    """
-    emotion_scores = (
-        envelope.classifier_output.top_3
-        if envelope.classifier_output else []
-    )
-    return update_trajectory(trajectory, emotion_scores)
+    # Returns 4-tuple — unpack in main.py
+    return envelope, trajectory, session_framework, intent_state
 
 
-def get_escalation_flag(trajectory: SessionTrajectory) -> TrajectoryFlag | None:
-    actionable = {
-        TrajectoryFlag.ESCALATING,
-        TrajectoryFlag.SUSTAINED_NEGATIVE,
-        TrajectoryFlag.AROUSAL_SPIKE,
-        TrajectoryFlag.SUPPRESSION,
-    }
-    flag = TrajectoryFlag(trajectory.current_flag)
-    return flag if flag in actionable else None
+# ---------------------------------------------------------------------------
+# RAG helpers
+# ---------------------------------------------------------------------------
+
+def _should_retrieve(planner_output, stage1_output: Stage1Output) -> bool:
+    cluster = planner_output.technique_cluster
+    technique_names = {t.name for t in cluster.techniques}
+
+    # Retrieve if psychoeducation is in the cluster
+    if any(t.modality == "psychoeducation" for t in cluster.techniques):
+        return True
+
+    # Retrieve if action_seeking + has_external_referents (factual query likely)
+    if stage1_output.has_external_referents and stage1_output.has_concrete_deadline:
+        return True
+
+    return False
+
+
+def _inject_rag_context(planner_output, rag_result) -> object:
+    if rag_result and rag_result.chunks:
+        summary = " ".join(c.content[:200] for c in rag_result.chunks[:2])
+        planner_output.technique_cluster.rag_context = summary
+        planner_output.technique_cluster.kb_sources  = [
+            c.source for c in rag_result.chunks[:2]
+        ]
+    return planner_output
