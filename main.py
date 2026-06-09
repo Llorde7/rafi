@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from time import perf_counter
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,19 +42,40 @@ redis: Redis = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(
-            text("ALTER TABLE turns ADD COLUMN IF NOT EXISTS planner_output JSON")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.execute(
+                text("ALTER TABLE turns ADD COLUMN IF NOT EXISTS planner_output JSON")
+            )
+            await conn.execute(
+                text("ALTER TABLE turns ADD COLUMN IF NOT EXISTS trace_output JSON")
+            )
+            await conn.execute(
+                text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tone_preference VARCHAR DEFAULT 'friendly'")
+            )
+        logger.info("Database connection + migrations OK")
+    except Exception as e:
+        logger.exception(
+            "Database startup failed (DB_URL=%s, host=%s). "
+            "App will start anyway, but DB-backed endpoints will fail. "
+            "Check: 1) Supabase project is not paused, 2) Internal vs External URL, "
+            "3) Render outbound network allows port 5432 to Supabase.",
+            os.getenv("DB_URL", "<not set>")[:80],
+            engine.url.host,
         )
-        await conn.execute(
-            text("ALTER TABLE turns ADD COLUMN IF NOT EXISTS trace_output JSON")
-        )
-        await conn.execute(
-            text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tone_preference VARCHAR DEFAULT 'friendly'")
-        )
-    redis = Redis.from_env()
+    try:
+        redis = Redis.from_env()
+        logger.info("Redis client initialized")
+    except Exception:
+        logger.exception("Redis.from_env() failed; redis-backed endpoints will fail")
+        redis = None
     yield
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "EmpathAI"}
 
 
 app = FastAPI(title="EmpathAI", lifespan=lifespan)
