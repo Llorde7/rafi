@@ -18,11 +18,13 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Ensure local .env overrides process env when present
+load_dotenv(override=True)
 
 
 def get_provider() -> str:
-    return os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+    # Default to 'groq' for safety if no provider is set in production envs
+    return os.getenv("LLM_PROVIDER", "groq").strip().lower()
 
 
 def get_default_model() -> str:
@@ -55,21 +57,30 @@ def _build_async_client() -> Any:
 
     if provider == "openrouter":
         from openai import AsyncOpenAI
-        _async_client = AsyncOpenAI(
-            api_key=os.environ["OPENROUTER_API_KEY"],
-            base_url="https://openrouter.ai/api/v1",
-        )
+        key = os.getenv("OPENROUTER_API_KEY")
+        if not key:
+            raise RuntimeError("LLM provider 'openrouter' selected but OPENROUTER_API_KEY is not set")
+        _async_client = AsyncOpenAI(api_key=key, base_url="https://openrouter.ai/api/v1")
     elif provider == "groq":
         from groq import AsyncGroq
-        _async_client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
+        key = os.getenv("GROQ_API_KEY")
+        if not key:
+            raise RuntimeError("LLM provider 'groq' selected but GROQ_API_KEY is not set")
+        _async_client = AsyncGroq(api_key=key)
     elif provider == "openai":
         from openai import AsyncOpenAI
-        _async_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        key = os.getenv("OPENAI_API_KEY")
+        if not key:
+            raise RuntimeError("LLM provider 'openai' selected but OPENAI_API_KEY is not set")
+        _async_client = AsyncOpenAI(api_key=key)
     elif provider == "gemini":
         # Gemini's SDK is sync; we expose a thin async shim with the same
         # chat.completions.create(...) surface so engine code is unchanged.
         from google import genai
-        _async_client = _GeminiAsyncShim(genai.Client(api_key=os.environ["GEMINI_API_KEY"]))
+        key = os.getenv("GEMINI_API_KEY")
+        if not key:
+            raise RuntimeError("LLM provider 'gemini' selected but GEMINI_API_KEY is not set")
+        _async_client = _GeminiAsyncShim(genai.Client(api_key=key))
     else:
         raise ValueError(f"Unknown LLM provider: {provider}")
 
