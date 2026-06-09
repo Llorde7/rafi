@@ -73,11 +73,6 @@ async def lifespan(app: FastAPI):
     yield
 
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "EmpathAI"}
-
-
 app = FastAPI(title="EmpathAI", lifespan=lifespan)
 
 # Enable CORS for frontend-backend communication
@@ -88,6 +83,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "EmpathAI"}
 
 
 # ─── Redis helpers ─────────────────────────────────────────────────────────────
