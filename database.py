@@ -17,6 +17,16 @@ if DATABASE_URL.startswith("postgresql://"):
 elif DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 
+# Ensure SSL for external Postgres hosts (Supabase, Neon, Render PG, etc.)
+# Supabase and most managed Postgres providers require SSL.
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+
+if "sslmode" not in DATABASE_URL:
+    parsed = urlparse(DATABASE_URL)
+    query = parse_qs(parsed.query)
+    query["sslmode"] = ["require"]
+    DATABASE_URL = urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
 if ":5432" in DATABASE_URL:
     engine = create_async_engine(
         DATABASE_URL,
@@ -26,6 +36,7 @@ if ":5432" in DATABASE_URL:
         max_overflow=10,
         connect_args={
             "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
+            "timeout": 10,
             "server_settings": {
                 "jit": "off",
                 "statement_timeout": "60000",
@@ -34,9 +45,12 @@ if ":5432" in DATABASE_URL:
     )
 else:
     engine = create_async_engine(
-        DATABASE_URL + "?prepared_statement_cache_size=0",
+        DATABASE_URL + "&prepared_statement_cache_size=0"
+        if "?" in DATABASE_URL
+        else DATABASE_URL + "?prepared_statement_cache_size=0",
         echo=False,
         poolclass=NullPool,
+        connect_args={"timeout": 10},
     )
 
 AsyncSessionLocal = sessionmaker(
