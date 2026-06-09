@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 from time import perf_counter
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,6 +65,39 @@ async def lifespan(app: FastAPI):
             os.getenv("DB_URL", "<not set>")[:80],
             engine.url.host,
         )
+    # Non-blocking network diagnostics for the DB host (helpful on platforms like Render)
+    async def _log_db_network_info(db_url: str | None):
+        if not db_url:
+            logger.info("No DB URL set for network diagnostics")
+            return
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(db_url)
+            host = p.hostname
+            port = p.port or 5432
+            logger.info("DB network diagnostic: host=%s port=%s", host, port)
+
+            def _blocking_check():
+                out = {}
+                try:
+                    addrs = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+                    out['addrs'] = list({a[4][0] for a in addrs})
+                except Exception as e:
+                    out['dns_error'] = str(e)
+                try:
+                    s = socket.create_connection((host, port), timeout=3)
+                    s.close()
+                    out['tcp'] = 'ok'
+                except Exception as e:
+                    out['tcp_error'] = str(e)
+                return out
+
+            res = await asyncio.to_thread(_blocking_check)
+            logger.info("DB network check result: %s", res)
+        except Exception as e:
+            logger.exception("DB network diagnostic failed: %s", e)
+
+    await _log_db_network_info(os.getenv('DB_URL') or os.getenv('DATABASE_URL'))
     try:
         redis = Redis.from_env()
         logger.info("Redis client initialized")
