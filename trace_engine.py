@@ -1,21 +1,20 @@
 import os
-from groq import AsyncGroq
 from contracts.trace_contract import TraceInput, TraceOutput, TraceConfidence
+from llm._provider import get_async_chat_client, get_default_model
+from llm.usage import instrumented_create
 
-MODEL  = "llama-3.3-70b-versatile"
+# Model is provider-aware: OpenRouter -> meta-llama/llama-3.3-70b-instruct:free
+#                            Groq      -> llama-3.3-70b-versatile
+MODEL = get_default_model()
 
 
 # ---------------------------------------------------------------------------
-# Lazy client — reads GROQ_API_KEY from env at first call, after load_dotenv()
+# Lazy client — provider is selected by LLM_PROVIDER env var
+#   openrouter (default) | groq | openai | gemini
 # ---------------------------------------------------------------------------
 
-_client: AsyncGroq | None = None
-
-def _get_client() -> AsyncGroq:
-    global _client
-    if _client is None:
-        _client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
-    return _client
+def _get_client():
+    return get_async_chat_client()
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +190,9 @@ async def generate(inp: TraceInput) -> TraceOutput:
         user_content += f"\n\nCLARIFYING QUESTION TO USE (if cluster requires one):\n{inp.clarifying_question_from_cae}"
 
     try:
-        response = await client.chat.completions.create(
+        response = await instrumented_create(
+            stage="trace",
+            client=client,
             model=MODEL,
             temperature=0.55,
             max_tokens=160,

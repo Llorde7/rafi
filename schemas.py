@@ -34,6 +34,7 @@ class TriggerSpan(BaseModel):
 
 
 class CausalAnalysis(BaseModel):
+    """Matches contracts.causal_contract.CausalOutput."""
     confidence_score: float
     confidence_category: str
     trigger_spans: list[TriggerSpan]
@@ -41,23 +42,38 @@ class CausalAnalysis(BaseModel):
     causal_chain: list[str]
     temporal_pattern: Optional[str] = None
     cause_type: str
+    cognitive_pattern: str = ""
+    behavioral_risk: str = ""
     clarifying_question: Optional[str] = None
     planner_instruction: str
     error: Optional[str] = None
 
 
+class PlannerTechnique(BaseModel):
+    name: str
+    modality: str
+    purpose: str
+    sequence_note: str
+
+
+class PlannerTechniqueCluster(BaseModel):
+    techniques: list[PlannerTechnique]
+    cluster_rationale: str
+    executor_instruction: str
+    rag_context: Optional[str] = None
+    kb_sources: list[str] = []
+
+
 class PlannerResult(BaseModel):
+    """Matches contracts.planner_contract.PlannerOutput."""
     framework: str
-    strategy: str
-    planner_confidence: str
-    rationale: str
+    intent_state_received: str = ""
+    technique_cluster: Optional[PlannerTechniqueCluster] = None
     clarifying_question: Optional[str] = None
     clarifying_question_overridden: bool = False
-    response_directive: str
+    response_directive: str = ""
     escalate_to_safety: bool = False
     escalation_reason: Optional[str] = None
-    kb_context: Optional[str] = None
-    kb_sources: list[str] = []
     kb_retrieval_attempted: bool = False
     error: Optional[str] = None
 

@@ -1,28 +1,27 @@
 import json
 import os
 from typing import Optional
-from groq import AsyncGroq
 from contracts.planner_contract import (
     PlannerInput, PlannerOutput, TechniqueCluster, Technique,
     ACTION_SEEKING_DISALLOWED_PRIMARY, PROCESSING_DISALLOWED,
     TECHNIQUE_SELECTION_MAP,
 )
 from contracts.intent_contract import IntentState
+from llm._provider import get_async_chat_client, get_default_model
+from llm.usage import instrumented_create
 
-MODEL  = "llama-3.3-70b-versatile"
+# Model is provider-aware: OpenRouter -> meta-llama/llama-3.3-70b-instruct:free
+#                            Groq      -> llama-3.3-70b-versatile
+MODEL = get_default_model()
 
 
 # ---------------------------------------------------------------------------
-# Lazy client — reads GROQ_API_KEY from env at first call, after load_dotenv()
+# Lazy client — provider is selected by LLM_PROVIDER env var
+#   openrouter (default) | groq | openai | gemini
 # ---------------------------------------------------------------------------
 
-_client: AsyncGroq | None = None
-
-def _get_client() -> AsyncGroq:
-    global _client
-    if _client is None:
-        _client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
-    return _client
+def _get_client():
+    return get_async_chat_client()
 
 
 # ---------------------------------------------------------------------------
@@ -108,10 +107,35 @@ REQUIRED:
 # Technique selection map as formatted string for prompt injection
 # ---------------------------------------------------------------------------
 
-def _technique_map_block() -> str:
-    lines = ["TECHNIQUE SELECTION REFERENCE MAP (situation_type × cognitive_pattern → cluster):"]
+def _technique_map_block(
+    situation_type: str | None = None,
+    cognitive_pattern: str | None = None,
+) -> str:
+    """
+    Slim mode: when situation_type and cognitive_pattern are supplied, only
+    inject the matching row(s) of the technique map — plus the generic
+    `("any", "any")` fallback. This typically cuts ~250–400 tokens per call
+    versus serialising the entire map.
+    """
+    lines = ["TECHNIQUE SELECTION REFERENCE (relevant rows for this turn):"]
+    matched = 0
     for (sit, cog), techniques in TECHNIQUE_SELECTION_MAP.items():
-        lines.append(f"  {sit} + {cog}: {' → '.join(techniques)}")
+        is_specific = (sit == situation_type and cog == cognitive_pattern)
+        is_sit_any = (sit == situation_type and cog == "any")
+        is_pat_any = (sit == "any" and cog == cognitive_pattern)
+        is_fallback = (sit == "any" and cog == "any")
+        # If caller didn't supply context, fall back to full map.
+        if situation_type is None and cognitive_pattern is None:
+            lines.append(f"  {sit} + {cog}: {' → '.join(techniques)}")
+            matched += 1
+            continue
+        if is_specific or is_sit_any or is_pat_any or is_fallback:
+            lines.append(f"  {sit} + {cog}: {' → '.join(techniques)}")
+            matched += 1
+    if matched == 0:
+        # Defensive fallback — should not happen given the "any"/"any" row.
+        for (sit, cog), techniques in TECHNIQUE_SELECTION_MAP.items():
+            lines.append(f"  {sit} + {cog}: {' → '.join(techniques)}")
     return "\n".join(lines)
 
 
@@ -255,13 +279,17 @@ async def plan(inp: PlannerInput, arousal: str = "medium", valence: float = -0.3
     if is_acute_panic(inp.text, arousal, valence):
         return _ground_response(inp)
 
-    # Build dynamic system prompt with intent constraint block
+    # Build dynamic system prompt with intent constraint block.
+    # Slim mode: only inject technique-map rows relevant to this turn.
     system_prompt = (
         BASE_SYSTEM_PROMPT
         + "\n\n"
         + _intent_constraint_block(inp.intent_state)
         + "\n\n"
-        + _technique_map_block()
+        + _technique_map_block(
+            situation_type=inp.situation_type,
+            cognitive_pattern=inp.cognitive_pattern,
+        )
     )
 
     user_content = f"""STUDENT MESSAGE: {inp.text}
@@ -289,7 +317,9 @@ SESSION HISTORY SUMMARY: {inp.session_history_summary or 'none — early session
 """
 
     client = _get_client()
-    response = await client.chat.completions.create(
+    response = await instrumented_create(
+        stage="planner",
+        client=client,
         model=MODEL,
         temperature=0.2,
         max_tokens=800,

@@ -6,6 +6,7 @@ upstash-redis
 python-dotenv
 groq
 google-genai
+openai
 pydantic
 qdrant-client
 fastembed

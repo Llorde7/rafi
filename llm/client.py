@@ -13,6 +13,7 @@ class LLMProvider(str, Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     GEMINI = "gemini"
+    OPENROUTER = "openrouter"
 
 
 class LLMClient(ABC):
@@ -246,14 +247,70 @@ class GeminiClient(LLMClient):
         yield {"token": full_response, "done": True}
 
 
+class OpenRouterClient(LLMClient):
+    """OpenRouter client (OpenAI-compatible API)."""
+
+    BASE_URL = "https://openrouter.ai/api/v1"
+
+    def __init__(self):
+        from openai import AsyncOpenAI
+        self._client = AsyncOpenAI(
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            base_url=self.BASE_URL,
+        )
+
+    def chat_completion_sync(
+        self,
+        model: str,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        raise NotImplementedError("Use async chat_completion for OpenRouter")
+
+    async def chat_completion(
+        self,
+        model: str,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        response = await self._client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content.strip()
+
+    async def chat_completion_stream(
+        self,
+        model: str,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+    ):
+        stream = await self._client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        async for chunk in stream:
+            if chunk.choices[0].delta.content:
+                yield {"token": chunk.choices[0].delta.content, "done": False}
+        yield {"token": "", "done": True}
+
+
 def get_llm_client(provider: str = None) -> tuple[LLMClient, str]:
     """
     Get configured LLM client and default model.
-    
-    Priority: LLM_PROVIDER env var > default (groq)
+
+    Priority: explicit `provider` arg > LLM_PROVIDER env var > default (openrouter)
     Returns: (client, default_model)
     """
-    provider = provider or os.getenv("LLM_PROVIDER", "groq").lower()
+    provider = (provider or os.getenv("LLM_PROVIDER", "openrouter")).lower()
 
     if provider == LLMProvider.GROQ:
         return GroqClient(), os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -261,6 +318,11 @@ def get_llm_client(provider: str = None) -> tuple[LLMClient, str]:
         return OpenAIClient(), os.getenv("OPENAI_MODEL", "gpt-4o")
     elif provider == LLMProvider.GEMINI:
         return GeminiClient(), os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    elif provider == LLMProvider.OPENROUTER:
+        return (
+            OpenRouterClient(),
+            os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
+        )
     elif provider == LLMProvider.ANTHROPIC:
         raise NotImplementedError("Anthropic client not yet implemented")
     else:
